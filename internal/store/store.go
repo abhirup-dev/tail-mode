@@ -234,7 +234,7 @@ func (s *Store) GetJob(ref, owner string) (Job, error) {
 // ListJobs returns owner's jobs (all owners' if all), newest first, with line stats. It does not check
 // pid liveness (jobs.List does).
 func (s *Store) ListJobs(owner string, all bool) ([]Job, error) {
-	rows, err := s.db.Query(`SELECT `+jobCols+` FROM jobs WHERE ? OR owner=? ORDER BY started_at DESC`, all, owner)
+	rows, err := s.db.Query(`SELECT `+jobCols+` FROM jobs WHERE ? OR owner=? ORDER BY started_at DESC, rowid DESC`, all, owner)
 	if err != nil {
 		return nil, err
 	}
