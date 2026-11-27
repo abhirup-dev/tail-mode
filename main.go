@@ -1,0 +1,22 @@
+// Command tail-mode tails local/remote logs and commands for coding agents. See SPEC.md.
+package main
+
+import (
+	"errors"
+	"fmt"
+	"os"
+
+	"github.com/abhirupdas/tail-mode/internal/cli"
+	"github.com/abhirupdas/tail-mode/internal/store"
+)
+
+func main() {
+	if err := cli.Run(os.Args[1:]); err != nil {
+		var ee store.ExitError
+		if errors.As(err, &ee) {
+			os.Exit(ee.Code)
+		}
+		fmt.Fprintf(os.Stderr, "tail-mode: %v\n", err)
+		os.Exit(1)
+	}
+}
