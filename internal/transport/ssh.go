@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -52,13 +53,27 @@ func (s ssh) Command(ctx context.Context, argv ...string) *exec.Cmd {
 	return exec.CommandContext(ctx, "ssh", args...)
 }
 
-// remoteCommand is the string the remote login shell runs: the wrapper with argv as its arguments.
+// remoteCommand is the string the remote login shell runs. ssh hands it to the user's login shell, which
+// may be sh, bash, zsh, fish, csh or tcsh, so it is login-shell neutral: the real script (argv as
+// positional parameters, then the wrapper) is base64-encoded and the login shell only sees
+//
+//	exec sh -c 's=$(printf %s <b64> | base64 -d) || exit 127; eval "$s"'
+//
+// one line, and only base64-alphabet characters between fixed syntax inside the single quotes. sh keeps
+// the ssh channel as its stdin (the command substitution has its own), so the wrapper's stdin-EOF
+// watchdog is unchanged. A failed decode exits 127 instead of looking like a clean, silent exit.
 func remoteCommand(argv []string) string {
+	return "exec sh -c 's=$(printf %s " + base64.StdEncoding.EncodeToString([]byte(remoteScript(argv))) +
+		` | base64 -d) || exit 127; eval "$s"'`
+}
+
+// remoteScript is the decoded script: set the positional parameters to argv, then run the wrapper.
+func remoteScript(argv []string) string {
 	q := make([]string, len(argv))
 	for i, a := range argv {
 		q[i] = Quote(a)
 	}
-	return "exec sh -c " + Quote(remoteWrapper) + " tail-mode " + strings.Join(q, " ")
+	return "set -- " + strings.Join(q, " ") + "\n" + remoteWrapper + "\n"
 }
 
 // remoteWrapper runs "$@" so that it cannot outlive the stream. Without a tty sshd never signals the
@@ -71,8 +86,6 @@ func remoteCommand(argv []string) string {
 //     if anything is left after ~3 s, KILLs it;
 //   - when the leader exits by itself, leftovers in its group are reaped the same way, the watchdog is
 //     stopped, and the leader's exit status is the wrapper's.
-//
-// It is one line so that csh-family login shells accept it too.
 const remoteWrapper = `reap() { kill -TERM $1 2>/dev/null || return 0; for i in 1 2 3; do sleep 1; kill -0 $1 2>/dev/null || return 0; done; kill -KILL $1 2>/dev/null; }; ` +
 	`exec 3<&0; ` +
 	`if command -v setsid >/dev/null 2>&1; then setsid "$@" </dev/null 3<&- & p=$!; g=-$p; ` +

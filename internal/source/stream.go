@@ -12,6 +12,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/charmbracelet/x/ansi"
+
 	"github.com/abhirup-dev/tail-mode/internal/transport"
 )
 
@@ -128,8 +130,27 @@ func stream(ctx context.Context, t transport.Transport, argv []string, emit func
 
 func killGroup(pgid int) error { return syscall.Kill(-pgid, syscall.SIGKILL) }
 
-// readLines sends each line of r (without "\n" or "\r\n") to out. Lines longer than maxLine are cut at
-// maxLine bytes and the rest of the line is discarded. Returns nil at EOF, else the read error.
+// clean makes a raw line read like a terminal shows it: trailing "\r"s are dropped, only the text after
+// the last remaining "\r" is kept (progress bars redraw with "\r"), and ANSI escape sequences are
+// stripped. ok is false for a line that only became empty here (a pure redraw or colour reset); lines
+// that were already empty are kept.
+func clean(raw []byte) (line string, ok bool) {
+	if len(bytes.TrimSuffix(raw, []byte("\r"))) == 0 { // blank, including a blank CRLF line
+		return "", true
+	}
+	b := bytes.TrimRight(raw, "\r")
+	if i := bytes.LastIndexByte(b, '\r'); i >= 0 {
+		b = b[i+1:]
+	}
+	line = string(b)
+	if bytes.IndexByte(b, 0x1b) >= 0 || bytes.Contains(b, []byte("\u009b")) {
+		line = ansi.Strip(line)
+	}
+	return line, line != ""
+}
+
+// readLines sends each line of r (without "\n"), cleaned by clean, to out. Lines longer than maxLine
+// are cut at maxLine bytes and the rest of the line is discarded. Returns nil at EOF, else the read error.
 func readLines(r io.Reader, out chan<- string) error {
 	br := bufio.NewReaderSize(r, 64<<10)
 	var line []byte
@@ -148,9 +169,11 @@ func readLines(r io.Reader, out chan<- string) error {
 		}
 		if err == nil || len(line) > 0 {
 			if !cut {
-				line = bytes.TrimSuffix(bytes.TrimSuffix(line, []byte("\n")), []byte("\r"))
+				line = bytes.TrimSuffix(line, []byte("\n"))
 			}
-			out <- string(line)
+			if l, ok := clean(line); ok {
+				out <- l
+			}
 		}
 		if err != nil {
 			if err == io.EOF {

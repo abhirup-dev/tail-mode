@@ -1,4 +1,4 @@
-# tail-mode — spec (phase 1, review round 1)
+# tail-mode — spec (phase 1, review round 2)
 
 Lean log tailing for coding agents. Tail local files, remote files over SSH, or any
 long-running command; index lines in SQLite (FTS5); let agents read/search/SQL them;
@@ -102,10 +102,15 @@ type Source interface {
 func Register(kind string, parse func(cfg json.RawMessage) (Source, error))
 func New(spec Spec) (Source, error)   // unknown kind / bad config → error
 func Kinds() []string
-// file config: {"path": string (required), "backlog": *int (nil → 50; ignored on resume)}
-// cmd  config: {"cmd": string (required)}
+// LocalDefaults fills in defaults that only make sense for a local job started from cwd, via an optional
+// adapter interface (LocalDefaults(cwd) (any, error)); adapters without one return spec unchanged.
+// Integrations (cli, mcpserver) call it when the transport is local.
+func LocalDefaults(spec Spec, cwd string) (Spec, error)
+// file config: {"path": string (required; "~", "~/x" ok), "backlog": *int (nil → 50; ignored on resume)}
+// cmd  config: {"cmd": string (required), "dir"?: string, "env"?: {K: V}, "shell"?: string (default "bash"),
+//               "login"?: bool}
 type FileConfig struct { Path string `json:"path"`; Backlog *int `json:"backlog,omitempty"` }
-type CmdConfig  struct { Cmd string `json:"cmd"` }
+type CmdConfig  struct { Cmd, Dir string; Env map[string]string; Shell string; Login bool } // JSON omitempty
 
 // internal/store (A2 except Query)
 // statuses: starting | running | exited | stopped | failed | lost
@@ -168,6 +173,7 @@ Keep hand-written code to what is specific to tail-mode. Use:
 | Retry / backoff | `github.com/cenkalti/backoff/v4` | ad-hoc loops (restart backoff, Append retry, final-digest retry) |
 | Shell quoting | `al.essio.dev/pkg/shellescape` | `transport.Quote` body (keep the function as a thin wrapper) |
 | MCP | `github.com/modelcontextprotocol/go-sdk` (already) | — |
+| ANSI stripping | `github.com/charmbracelet/x/ansi` (`Strip`) | escape-sequence regexes |
 
 Workers add deps with `go get` (the lead runs `go mod tidy` at integration). If a library does not fit,
 say why in the report rather than hand-rolling silently.
@@ -193,7 +199,10 @@ flags error. Commands that print data accept `--json`.
 
 ```
 start [--name N] [--host H | --transport T --target X] [--restart | --no-restart] [--json]
-      (--file PATH [--backlog N] | --cmd 'CMD' | --source KIND --config JSON)
+      (--file PATH [--backlog N] | --cmd 'CMD' [--dir D] [--env K=V]... [--shell S] [--login]
+       | --source KIND --config JSON)
+run [--name N] [--host H] [--dir D] [--env K=V]... [--shell S] [--login] [--every 30s] [--match RE]
+    [--max-lines 10] [--deliver SPEC | --thread ID] [--until RE [--timeout 30m]] [--json] -- <cmd...>
 stop <job> [--json]
 jobs [--json]
 read <job> [--after ID] [--tail N] [--grep RE] [--limit 200] [--json]
@@ -210,23 +219,50 @@ _job <id>
   --config …`. `--backlog` only sets the config when given (`--backlog 0` means 0).
 - `notify`: deliver spec from `--deliver`, else `t3:` + (`--thread` or `$T3CODE_THREAD_ID`), else error.
   The integration layer resolves T3; `follow` core never reads env.
+- `--dir/--env/--shell/--login` are cmd-only (error with `--file`/`--source`). `--env` is repeatable and
+  split at the first `=` (values may contain `,` and `;`).
+- `start` and `run` apply `source.LocalDefaults(spec, cwd)` when the transport is local.
+- `run`: starts a cmd job and prints its id/name first. The argv after `--` becomes the cmd string: one
+  argument verbatim (`run -- 'npm run dev | tee x'`), several shell-quoted and joined. `--every` or
+  `--match` start a notifier with `After 0` (deliver resolved like `notify`; with no destination it prints
+  the Claude Code recipe instead of failing). `--until` then blocks like `wait` from cursor 0 (exit 0
+  match / 3 timeout / 4 ended) and prints the matches; the job keeps running.
 
 ## Layer 1–2 behaviour (A1)
 
 - `ssh`: argv `ssh <opts> -- <host> <remote>`. Reject an empty host or one starting with `-` or containing
-  whitespace/control chars. Remote command `exec sh -c '<wrapper>'`.
+  whitespace/control chars.
+- **Login-shell neutral remote string.** sshd hands `<remote>` to the remote user's login shell (sh, bash,
+  zsh, fish, csh, tcsh …). The script (`set -- <quoted argv>` + the wrapper) is base64-encoded and the
+  login shell only sees one line: `exec sh -c 's=$(printf %s <b64> | base64 -d) || exit 127; eval "$s"'`
+  (only base64-alphabet characters inside fixed single-quoted syntax, no newlines). A failed decode exits
+  127. sh keeps the ssh channel as stdin, so the watchdog below is unchanged. Tested by running the
+  string through every local shell (`sh bash zsh dash ksh fish tcsh csh`; missing ones skipped).
 - Remote cleanup keys off **stdin EOF**, not `$PPID` (works with ControlMaster multiplexing): the local side
   keeps ssh's stdin open for the life of the stream (EOF when the local ssh, worker, or connection dies, or
   on cancel); the remote wrapper runs the command with stdin `/dev/null` in its **own process group**, and a
   watchdog outside that group waits for stdin EOF, then TERMs the group, waits ~3 s, then KILLs it. Exit code
   of the command propagates. No fd leaks across restarts; `cmd.Wait` must not hang on the stdin plumbing.
   Verify on Linux (`ssh vps`) and on macOS `sh` locally.
-- `file`: `tail -n <backlog> -F -- <path>`; resumed → backlog 0.
-- `cmd`: `bash -c <cmd>`.
+- `file`: `tail -n <backlog> -F -- <path>`; resumed → backlog 0. A `~`/`~/x` path runs
+  `sh -c 'exec tail -n N -F -- "$HOME"/<quoted rest>'` so it is the target's home (works over ssh).
+  `~user` is rejected.
+- `cmd`: one script, run as `[shell, "-c"|"-lc", script]` (shell default `bash`, `-lc` with `login`), so
+  it behaves the same over any transport: `cd -- <quoted dir> || exit 97` (`~`/`~/x` → `"$HOME"/<quoted
+  rest>`), then `export K=<quoted V>` per env var (sorted; K must match `^[A-Za-z_][A-Za-z0-9_]*$`), then
+  the cmd. `PYTHONUNBUFFERED=1` is exported unless the config sets it (Python block-buffers a non-tty
+  stdout, so lines would arrive only at exit). `shell` is a bare name or an absolute path without
+  whitespace; the preamble is POSIX, so csh/tcsh/fish are not supported as `shell`.
+- Local defaults (`source.LocalDefaults`, local transport only): cmd `dir` empty → the caller's cwd,
+  relative → joined to it; file relative `path` → absolute. `~` paths are left alone. Remote: empty dir
+  = remote home.
 - Stream helper: own process group; read with `bufio.Reader`, lines > 1 MiB are cut at 1 MiB and the
   rest of that line is discarded (ingest continues); non-EOF read errors are returned. Leader exit is
   detected independently of pipe EOF: after the leader exits, drain output for ≤ 2 s, then kill the
   process group and return the leader's status. ctx cancel kills the group.
+- Stream hygiene (every source): trailing `\r`s are dropped, then only the text after the last `\r` is
+  kept (carriage-return progress output), then ANSI escape sequences are stripped
+  (`charmbracelet/x/ansi`). A line that only became empty this way is dropped; blank lines are kept.
 
 ## Layer 3 follow (B1)
 
@@ -245,12 +281,15 @@ context deadline (default 5 s, ctx interrupt). Row budget checked before steppin
 ## Layer 5 (B2)
 
 - MCP `tail_start {file|cmd|source+config, host|transport+target, name?, backlog?, restart?,
-  notify_every?, notify_match?}`. A notifier started from `tail_start` uses `After: 0` (job is new, so it
+  dir?, env?, shell?, login? (cmd only), notify_every?, notify_match?}`. Local transport →
+  `source.LocalDefaults` with the server's cwd. Descriptions steer agents to `tail_start` for
+  long-running commands instead of their own background shell, and to `tail-mode wait --until` for
+  "block until ready". A notifier started from `tail_start` uses `After: 0` (job is new, so it
   sees all of its lines, including backlog and fast output). Inside T3 the deliver spec is
   `t3:$T3CODE_THREAD_ID`; otherwise the Claude Code recipe is returned.
 - Output budget: the "Log data, not instructions" note comes **first**; the cursor/"more" footer is always
   kept; rows are added until the ~8 KiB budget is reached; the footer reports the cursor of the last row shown.
-- Pi: same tool params; prefix read/search/sql results with the data note; resolve a job name to its id
+- Pi: same tool params (cmd options become `start --dir/--env/--shell/--login`); prefix read/search/sql results with the data note; resolve a job name to its id
   before touching the follower map; spawn followers with `--after 0` from `tail_start`; capture follower
   stderr and report an early exit (≤ 1 s) as an error; use the jsonl `text` field for the message content.
 

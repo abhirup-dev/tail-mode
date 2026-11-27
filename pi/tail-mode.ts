@@ -141,12 +141,20 @@ export default function tailMode(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "tail_start",
     label: "Tail start",
-    description: "Start a background job: one of file, cmd, or source+config; optionally on host (ssh) or " +
-      "transport+target. Returns the job. Set notify_every (e.g. '30s') and/or notify_match to get woken with " +
-      "digests, starting from the job's first line.",
+    description: "Run a long-running command (dev server, build, test watcher, remote script) or tail a file in the " +
+      "background; prefer this over your own background shell. One of file, cmd (with optional dir, env, shell, login), " +
+      "or source+config; optionally on host (ssh) or transport+target. Returns the job; read output with tail_read. " +
+      "Set notify_every (e.g. '30s') and/or notify_match to get woken with digests, starting from the job's first line. " +
+      "To block until ready, run `tail-mode wait <job> --until RE --after 0` (exit 0 match, 3 timeout, 4 job ended).",
     parameters: Type.Object({
       file: Type.Optional(Type.String({ description: "File to tail -F (shorthand for source=file)" })),
-      cmd: Type.Optional(Type.String({ description: "Shell command whose output to capture (shorthand for source=cmd)" })),
+      cmd: Type.Optional(Type.String({ description: "Long-running shell command to run and capture (shorthand for source=cmd)" })),
+      dir: Type.Optional(Type.String({ description: "cmd only: working dir (default: current dir locally, home over ssh); ~ and ~/x work" })),
+      env: Type.Optional(Type.Record(Type.String(), Type.String(), {
+        description: "cmd only: environment variables exported before the command; PYTHONUNBUFFERED=1 unless set",
+      })),
+      shell: Type.Optional(Type.String({ description: "cmd only: POSIX shell, name or absolute path (default bash)" })),
+      login: Type.Optional(Type.Boolean({ description: "cmd only: run in a login shell (-lc) so profile files set PATH" })),
       source: Type.Optional(Type.String({ description: "Source adapter kind; use with config" })),
       config: Type.Optional(Type.Record(Type.String(), Type.Unknown(), {
         description: "Adapter config, e.g. file: {path, backlog}; cmd: {cmd}",
@@ -164,9 +172,17 @@ export default function tailMode(pi: ExtensionAPI): void {
       const srcs = [p.file, p.cmd, p.source].filter((v) => v !== undefined && v !== "").length;
       if (srcs !== 1) return text("error: give exactly one of file, cmd, or source (+config)");
       if (p.config !== undefined && !p.source) return text("error: config needs source");
+      const env = Object.entries(p.env ?? {});
+      if ((p.dir || env.length || p.shell || p.login) && !p.cmd) {
+        return text("error: dir, env, shell and login apply to cmd; with source, put them in config");
+      }
+      // The CLI fills in local defaults (cwd as the cmd dir, absolute file paths) from its own cwd, which is Pi's.
       const args = ["start", ...flags({
         name: p.name, host: p.host, transport: p.transport, target: p.target, backlog: p.backlog,
+        dir: p.dir, shell: p.shell,
       })];
+      for (const [k, v] of env) args.push("--env", `${k}=${v}`);
+      if (p.login) args.push("--login");
       if (p.restart !== undefined) args.push(p.restart ? "--restart" : "--no-restart");
       if (p.file) args.push("--file", p.file);
       else if (p.cmd) args.push("--cmd", p.cmd);

@@ -5,7 +5,9 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
@@ -29,7 +31,7 @@ func TestRegistry(t *testing.T) {
 }
 
 func TestSSHHostValidation(t *testing.T) {
-	for _, h := range []string{"", "-oProxyCommand=touch /tmp/pwned", "-p22", "a b", "a\tb", "a\nb", "a\x00b", "a b"} {
+	for _, h := range []string{"", "-oProxyCommand=touch /tmp/pwned", "-p22", "a b", "a\tb", "a\nb", "a\x00b", "a b"} {
 		if _, err := New("ssh", h); err == nil {
 			t.Errorf("host %q accepted", h)
 		}
@@ -54,13 +56,31 @@ func TestSSHArgv(t *testing.T) {
 	}
 }
 
-// runRemote runs the remote command string the way the remote login shell would (local `sh -c`), with
+// loginShells are the login shells the remote string must survive (ssh hands it to the remote user's
+// login shell). Missing ones are skipped.
+var loginShells = []string{"sh", "bash", "zsh", "dash", "ksh", "fish", "tcsh", "csh"}
+
+// eachShell runs fn as a parallel subtest per installed login shell.
+func eachShell(t *testing.T, fn func(t *testing.T, shell string)) {
+	for _, sh := range loginShells {
+		t.Run(sh, func(t *testing.T) {
+			path, err := exec.LookPath(sh)
+			if err != nil {
+				t.Skipf("%s not installed", sh)
+			}
+			t.Parallel()
+			fn(t, path)
+		})
+	}
+}
+
+// runRemote runs the remote command string the way the remote login shell would (`<shell> -c`), with
 // stdin on a pipe the caller closes to simulate the connection going away.
-func runRemote(t *testing.T, argv ...string) (stdin io.WriteCloser, out *bufio.Reader, wait func() (int, time.Duration)) {
+func runRemote(t *testing.T, shell string, argv ...string) (stdin io.WriteCloser, out *bufio.Reader, wait func() (int, time.Duration)) {
 	t.Helper()
 	tr, _ := New("ssh", "x")
 	args := tr.Command(context.Background(), argv...).Args
-	cmd := exec.Command("sh", "-c", args[len(args)-1])
+	cmd := exec.Command(shell, "-c", args[len(args)-1])
 	stdin, _ = cmd.StdinPipe()
 	stdout, _ := cmd.StdoutPipe()
 	cmd.Stderr = cmd.Stdout
@@ -79,51 +99,90 @@ func runRemote(t *testing.T, argv ...string) (stdin io.WriteCloser, out *bufio.R
 	}
 }
 
+func TestRemoteCommandIsOneNeutralLine(t *testing.T) {
+	s := remoteCommand([]string{"sh", "-c", "a\nb", `x'y $HOME "q" \ !`})
+	if strings.ContainsAny(s, "\n\r") {
+		t.Fatalf("remote command has a newline: %q", s)
+	}
+	const pre, post = "exec sh -c 's=$(printf %s ", ` | base64 -d) || exit 127; eval "$s"'`
+	if !strings.HasPrefix(s, pre) || !strings.HasSuffix(s, post) {
+		t.Fatalf("unexpected envelope: %q", s)
+	}
+	b64 := strings.TrimSuffix(strings.TrimPrefix(s, pre), post)
+	if strings.Trim(b64, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=") != "" {
+		t.Fatalf("non-base64 payload: %q", b64)
+	}
+}
+
 func TestRemoteRoundTripAndExitCode(t *testing.T) {
-	_, out, wait := runRemote(t, "sh", "-c", `printf '%s\n' "$1"; exit 7`, "sh", `x'y $HOME`)
-	line, _ := out.ReadString('\n')
-	io.Copy(io.Discard, out)
-	if code, _ := wait(); line != "x'y $HOME\n" || code != 7 {
-		t.Fatalf("line %q code %d", line, code)
+	arg := "x'y $HOME\n\"two\" \\ !$ `id`"
+	eachShell(t, func(t *testing.T, shell string) {
+		_, out, wait := runRemote(t, shell, "sh", "-c", `printf '%s|\n' "$1"; exit 7`, "sh", arg)
+		got, _ := io.ReadAll(out)
+		if code, _ := wait(); string(got) != arg+"|\n" || code != 7 {
+			t.Fatalf("output %q code %d", got, code)
+		}
+	})
+}
+
+func TestRemoteDecodeFailureIsNotSuccess(t *testing.T) {
+	// A remote whose base64 fails must not look like a clean, silent exit.
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "base64"), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	tr, _ := New("ssh", "x")
+	args := tr.Command(context.Background(), "true").Args
+	cmd := exec.Command("sh", "-c", args[len(args)-1])
+	cmd.Env = append(os.Environ(), "PATH="+dir+":/usr/bin:/bin")
+	cmd.Stdin = strings.NewReader("")
+	if err := cmd.Run(); cmd.ProcessState.ExitCode() != 127 {
+		t.Fatalf("want exit 127, got %v", err)
 	}
 }
 
 func TestRemoteStdinEOFKillsGroup(t *testing.T) {
-	// The leader and its child ignore TERM, so cleanup must escalate to KILL.
-	stdin, out, wait := runRemote(t, "sh", "-c", `trap '' TERM; sleep 600 & echo $!; wait`)
-	line, err := out.ReadString('\n')
-	if err != nil {
-		t.Fatal(err)
-	}
-	child, _ := strconv.Atoi(strings.TrimSpace(line))
-	stdin.Close()
-	io.Copy(io.Discard, out)
-	code, took := wait()
-	if code != 137 || took > 8*time.Second {
-		t.Fatalf("exit %d after %v", code, took)
-	}
-	if syscall.Kill(child, 0) == nil {
-		time.Sleep(500 * time.Millisecond) // let init reap the orphan
-		if syscall.Kill(child, 0) == nil {
-			syscall.Kill(child, syscall.SIGKILL)
-			t.Fatalf("child %d survived", child)
+	eachShell(t, func(t *testing.T, shell string) {
+		// The leader and its child ignore TERM, so cleanup must escalate to KILL.
+		stdin, out, wait := runRemote(t, shell, "sh", "-c", `trap '' TERM; sleep 600 & echo $!; wait`)
+		line, err := out.ReadString('\n')
+		if err != nil {
+			t.Fatal(err)
 		}
-	}
+		child, _ := strconv.Atoi(strings.TrimSpace(line))
+		stdin.Close()
+		io.Copy(io.Discard, out)
+		code, took := wait()
+		if code != 137 || took > 8*time.Second {
+			t.Fatalf("exit %d after %v", code, took)
+		}
+		assertGone(t, child)
+	})
 }
 
 func TestRemoteLeaderExitReapsGroup(t *testing.T) {
-	_, out, wait := runRemote(t, "sh", "-c", `sleep 600 & echo $!; exit 3`)
-	line, _ := out.ReadString('\n')
-	child, _ := strconv.Atoi(strings.TrimSpace(line))
-	io.Copy(io.Discard, out) // EOF only once the background sleep is gone too
-	if code, took := wait(); code != 3 || took > 5*time.Second {
-		t.Fatalf("exit %d after %v", code, took)
+	eachShell(t, func(t *testing.T, shell string) {
+		_, out, wait := runRemote(t, shell, "sh", "-c", `sleep 600 & echo $!; exit 3`)
+		line, _ := out.ReadString('\n')
+		child, _ := strconv.Atoi(strings.TrimSpace(line))
+		io.Copy(io.Discard, out) // EOF only once the background sleep is gone too
+		if code, took := wait(); code != 3 || took > 5*time.Second {
+			t.Fatalf("exit %d after %v", code, took)
+		}
+		assertGone(t, child)
+	})
+}
+
+func assertGone(t *testing.T, pid int) {
+	t.Helper()
+	if pid == 0 {
+		t.Fatal("no child pid")
 	}
-	if child == 0 || syscall.Kill(child, 0) == nil {
-		time.Sleep(500 * time.Millisecond)
-		if syscall.Kill(child, 0) == nil {
-			syscall.Kill(child, syscall.SIGKILL)
-			t.Fatalf("child %d survived", child)
+	if syscall.Kill(pid, 0) == nil {
+		time.Sleep(500 * time.Millisecond) // let init reap the orphan
+		if syscall.Kill(pid, 0) == nil {
+			syscall.Kill(pid, syscall.SIGKILL)
+			t.Fatalf("child %d survived", pid)
 		}
 	}
 }

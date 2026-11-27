@@ -47,6 +47,34 @@ func New(spec Spec) (Source, error) {
 	return parse(spec.Config)
 }
 
+// localDefaulter is implemented by adapters whose config depends on where a local caller is: it returns
+// the config with those defaults filled in (e.g. a relative path made absolute against cwd).
+type localDefaulter interface {
+	LocalDefaults(cwd string) (any, error)
+}
+
+// LocalDefaults fills in the defaults that only make sense for a job on the local transport, started by
+// a caller whose working directory is cwd (the detached worker's cwd is not the caller's). Integrations
+// call it when the transport is local; adapters without such defaults return spec unchanged.
+func LocalDefaults(spec Spec, cwd string) (Spec, error) {
+	src, err := New(spec)
+	if err != nil {
+		return spec, err
+	}
+	ld, ok := src.(localDefaulter)
+	if !ok {
+		return spec, nil
+	}
+	cfg, err := ld.LocalDefaults(cwd)
+	if err != nil {
+		return spec, err
+	}
+	if spec.Config, err = json.Marshal(cfg); err != nil {
+		return spec, err
+	}
+	return spec, nil
+}
+
 // Kinds lists the registered adapter kinds, sorted.
 func Kinds() []string { return slices.Sorted(maps.Keys(parsers)) }
 

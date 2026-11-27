@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -224,5 +226,47 @@ func TestNotifyRecipe(t *testing.T) {
 	out, err = notify("j000001", 30e9, "", "", -1)
 	if err != nil || strings.Contains(out, "--after") {
 		t.Fatalf("%v\n%s", err, out)
+	}
+}
+
+func TestStartCmdOptionsAndLocalDefaults(t *testing.T) {
+	started, _ := stubs(t)
+	t.Setenv("T3CODE_THREAD_ID", "")
+	cs := client(t, testStore(t))
+	call(t, cs, "tail_start", map[string]any{"cmd": "npm run dev", "env": map[string]any{"PORT": "3000"}, "shell": "zsh", "login": true})
+	var c source.CmdConfig
+	if err := json.Unmarshal(started.Spec.Config, &c); err != nil {
+		t.Fatal(err)
+	}
+	cwd, _ := os.Getwd()
+	if c.Cmd != "npm run dev" || c.Dir != cwd || c.Env["PORT"] != "3000" || c.Shell != "zsh" || !c.Login {
+		t.Fatalf("local cmd config %+v", c)
+	}
+
+	// Remote: an empty dir stays empty (remote home), and paths are not touched.
+	call(t, cs, "tail_start", map[string]any{"cmd": "make", "host": "vps"})
+	if string(started.Spec.Config) != `{"cmd":"make"}` || started.Target != "vps" {
+		t.Fatalf("remote spec %s", started.Spec.Config)
+	}
+	call(t, cs, "tail_start", map[string]any{"file": "logs/app.log"})
+	if string(started.Spec.Config) != `{"path":"`+filepath.Join(cwd, "logs/app.log")+`"}` {
+		t.Fatalf("local file spec %s", started.Spec.Config)
+	}
+	call(t, cs, "tail_start", map[string]any{"source": "cmd", "config": map[string]any{"cmd": "x"}})
+	if string(started.Spec.Config) != `{"cmd":"x","dir":`+strconv.Quote(cwd)+`}` {
+		t.Fatalf("generic cmd spec %s", started.Spec.Config)
+	}
+
+	for _, in := range []StartIn{
+		{File: "a", Dir: "/x"},
+		{File: "a", Login: true},
+		{Source: "cmd", Config: map[string]any{"cmd": "x"}, Env: map[string]string{"A": "1"}},
+	} {
+		if _, err := startOpts(in); err == nil {
+			t.Errorf("want error for %+v", in)
+		}
+	}
+	if _, err := start(nil, StartIn{Cmd: "x", Env: map[string]string{"1A": "v"}}); err == nil {
+		t.Error("invalid env name accepted")
 	}
 }
