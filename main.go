@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/abhirupdas/tail-mode/internal/cli"
-	"github.com/abhirupdas/tail-mode/internal/store"
+	"github.com/abhirup-dev/tail-mode/internal/cli"
+	"github.com/abhirup-dev/tail-mode/internal/store"
 )
 
 func main() {

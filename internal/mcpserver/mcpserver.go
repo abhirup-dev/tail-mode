@@ -11,12 +11,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/abhirupdas/tail-mode/internal/deliver"
-	"github.com/abhirupdas/tail-mode/internal/follow"
-	"github.com/abhirupdas/tail-mode/internal/jobs"
-	"github.com/abhirupdas/tail-mode/internal/source"
-	"github.com/abhirupdas/tail-mode/internal/store"
-	"github.com/abhirupdas/tail-mode/internal/transport"
+	"github.com/abhirup-dev/tail-mode/internal/deliver"
+	"github.com/abhirup-dev/tail-mode/internal/follow"
+	"github.com/abhirup-dev/tail-mode/internal/jobs"
+	"github.com/abhirup-dev/tail-mode/internal/source"
+	"github.com/abhirup-dev/tail-mode/internal/store"
+	"github.com/abhirup-dev/tail-mode/internal/transport"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 

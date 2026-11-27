@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/abhirupdas/tail-mode/internal/store"
+	"github.com/abhirup-dev/tail-mode/internal/store"
 )
 
 func mustParse(t *testing.T, args ...string) *root {

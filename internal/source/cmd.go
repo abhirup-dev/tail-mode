@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/abhirupdas/tail-mode/internal/transport"
+	"github.com/abhirup-dev/tail-mode/internal/transport"
 )
 
 // CmdConfig is the "cmd" adapter's config.

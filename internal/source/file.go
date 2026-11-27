@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strconv"
 
-	"github.com/abhirupdas/tail-mode/internal/transport"
+	"github.com/abhirup-dev/tail-mode/internal/transport"
 )
 
 // FileConfig is the "file" adapter's config.

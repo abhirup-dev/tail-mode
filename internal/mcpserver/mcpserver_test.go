@@ -10,10 +10,10 @@ import (
 	"testing"
 	"unicode/utf8"
 
-	"github.com/abhirupdas/tail-mode/internal/follow"
-	"github.com/abhirupdas/tail-mode/internal/jobs"
-	"github.com/abhirupdas/tail-mode/internal/source"
-	"github.com/abhirupdas/tail-mode/internal/store"
+	"github.com/abhirup-dev/tail-mode/internal/follow"
+	"github.com/abhirup-dev/tail-mode/internal/jobs"
+	"github.com/abhirup-dev/tail-mode/internal/source"
+	"github.com/abhirup-dev/tail-mode/internal/store"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 

@@ -17,12 +17,12 @@ import (
 
 	"github.com/alecthomas/kong"
 
-	"github.com/abhirupdas/tail-mode/internal/deliver"
-	"github.com/abhirupdas/tail-mode/internal/follow"
-	"github.com/abhirupdas/tail-mode/internal/jobs"
-	"github.com/abhirupdas/tail-mode/internal/mcpserver"
-	"github.com/abhirupdas/tail-mode/internal/source"
-	"github.com/abhirupdas/tail-mode/internal/store"
+	"github.com/abhirup-dev/tail-mode/internal/deliver"
+	"github.com/abhirup-dev/tail-mode/internal/follow"
+	"github.com/abhirup-dev/tail-mode/internal/jobs"
+	"github.com/abhirup-dev/tail-mode/internal/mcpserver"
+	"github.com/abhirup-dev/tail-mode/internal/source"
+	"github.com/abhirup-dev/tail-mode/internal/store"
 )
 
 // stdout is where command output goes (a test knob).

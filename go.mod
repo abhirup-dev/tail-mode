@@ -1,4 +1,4 @@
-module github.com/abhirupdas/tail-mode
+module github.com/abhirup-dev/tail-mode
 
 go 1.26.10
 

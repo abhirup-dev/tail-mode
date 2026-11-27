@@ -12,7 +12,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/abhirupdas/tail-mode/internal/transport"
+	"github.com/abhirup-dev/tail-mode/internal/transport"
 )
 
 const (

@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/abhirupdas/tail-mode/internal/transport"
+	"github.com/abhirup-dev/tail-mode/internal/transport"
 )
 
 // Live checks against a real host: TAIL_MODE_SSH_TEST_HOST=myhost go test -run SSH ./internal/source/

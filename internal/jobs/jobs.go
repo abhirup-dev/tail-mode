@@ -17,10 +17,10 @@ import (
 
 	"github.com/cenkalti/backoff/v4"
 
-	"github.com/abhirupdas/tail-mode/internal/proc"
-	"github.com/abhirupdas/tail-mode/internal/source"
-	"github.com/abhirupdas/tail-mode/internal/store"
-	"github.com/abhirupdas/tail-mode/internal/transport"
+	"github.com/abhirup-dev/tail-mode/internal/proc"
+	"github.com/abhirup-dev/tail-mode/internal/source"
+	"github.com/abhirup-dev/tail-mode/internal/store"
+	"github.com/abhirup-dev/tail-mode/internal/transport"
 )
 
 // Timings; variables so tests can shorten them.

@@ -12,10 +12,10 @@ import (
 
 	"github.com/cenkalti/backoff/v4"
 
-	"github.com/abhirupdas/tail-mode/internal/deliver"
-	"github.com/abhirupdas/tail-mode/internal/jobs"
-	"github.com/abhirupdas/tail-mode/internal/proc"
-	"github.com/abhirupdas/tail-mode/internal/store"
+	"github.com/abhirup-dev/tail-mode/internal/deliver"
+	"github.com/abhirup-dev/tail-mode/internal/jobs"
+	"github.com/abhirup-dev/tail-mode/internal/proc"
+	"github.com/abhirup-dev/tail-mode/internal/store"
 )
 
 type Options struct {

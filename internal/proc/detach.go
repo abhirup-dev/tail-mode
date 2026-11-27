@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"syscall"
 
-	"github.com/abhirupdas/tail-mode/internal/store"
+	"github.com/abhirup-dev/tail-mode/internal/store"
 )
 
 // Detach re-execs this binary with args in a new session, stdin /dev/null, stdout/stderr appended to

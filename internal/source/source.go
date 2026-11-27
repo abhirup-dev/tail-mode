@@ -10,7 +10,7 @@ import (
 	"maps"
 	"slices"
 
-	"github.com/abhirupdas/tail-mode/internal/transport"
+	"github.com/abhirup-dev/tail-mode/internal/transport"
 )
 
 // Spec is the persisted description of a source (stored as JSON in jobs.spec).

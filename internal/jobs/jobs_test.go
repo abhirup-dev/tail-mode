@@ -15,10 +15,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/abhirupdas/tail-mode/internal/proc"
-	"github.com/abhirupdas/tail-mode/internal/source"
-	"github.com/abhirupdas/tail-mode/internal/store"
-	"github.com/abhirupdas/tail-mode/internal/transport"
+	"github.com/abhirup-dev/tail-mode/internal/proc"
+	"github.com/abhirup-dev/tail-mode/internal/source"
+	"github.com/abhirup-dev/tail-mode/internal/store"
+	"github.com/abhirup-dev/tail-mode/internal/transport"
 )
 
 // TestMain doubles as the detached worker: proc.Detach re-execs this test binary as `_job <id>`.
