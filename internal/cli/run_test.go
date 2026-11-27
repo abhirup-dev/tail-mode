@@ -91,9 +91,9 @@ func fakeRun(t *testing.T, lines []string, ended bool) (*jobs.StartOpts, *[]foll
 				return j, err
 			}
 		}
-		return s.GetJob(j.ID)
+		return s.GetJob(j.ID, "")
 	}
-	startNotifier = func(job string, o follow.NotifierOpts) (int, error) {
+	startNotifier = func(_ *store.Store, job string, o follow.NotifierOpts) (int, error) {
 		notifiers = append(notifiers, o)
 		return 4242, nil
 	}

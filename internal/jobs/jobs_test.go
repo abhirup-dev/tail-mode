@@ -134,7 +134,7 @@ func texts(t *testing.T, s *store.Store, id string) []string {
 }
 
 func status(t *testing.T, s *store.Store, id string) store.Job {
-	j, err := s.GetJob(id)
+	j, err := s.GetJob(id, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,7 +213,7 @@ func TestStartValidates(t *testing.T) {
 			t.Fatalf("want error for %+v", o)
 		}
 	}
-	if js, _ := s.ListJobs(); len(js) != 0 {
+	if js, _ := s.ListJobs("", true); len(js) != 0 {
 		t.Fatalf("invalid starts created rows: %+v", js)
 	}
 }
@@ -225,7 +225,7 @@ func TestStartStopWorker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { Stop(s, j.ID) })
+	t.Cleanup(func() { Stop(s, j.ID, "", false) })
 	if j.Status != "running" || j.PID <= 0 || j.PID == os.Getpid() || j.Transport != "local" {
 		t.Fatalf("started %+v", j)
 	}
@@ -237,11 +237,11 @@ func TestStartStopWorker(t *testing.T) {
 			t.Fatalf("lines %q", texts(t, s, j.ID))
 		}
 	}
-	js, _ := List(s)
+	js, _ := List(s, "", true)
 	if len(js) != 1 || js[0].Status != "running" || js[0].Lines != 2 {
 		t.Fatalf("list %+v", js)
 	}
-	j, err = Stop(s, "w")
+	j, err = Stop(s, "w", "", false)
 	if err != nil || j.Status != "stopped" {
 		t.Fatalf("stop: %v %+v", err, j)
 	}
@@ -262,12 +262,12 @@ func TestStartingRace(t *testing.T) {
 	id := mkJob(t, s, fakeSpec(fake{Hold: true}), "starting")
 
 	// List in the window between CreateJob and claim must not mark it lost.
-	js, err := List(s)
+	js, err := List(s, "", true)
 	if err != nil || js[0].Status != "starting" || status(t, s, id).Status != "starting" {
 		t.Fatalf("list in start window: %v %+v", err, js)
 	}
 	// Stop still stops it, without signalling anything (pid is 0).
-	j, err := Stop(s, id)
+	j, err := Stop(s, id, "", false)
 	if err != nil || j.Status != "stopped" {
 		t.Fatalf("stop starting: %v %+v", err, j)
 	}
@@ -308,12 +308,12 @@ func TestLockLiveness(t *testing.T) {
 		t.Fatalf("locked: %s", st)
 	}
 	release()
-	js, _ := List(s)
+	js, _ := List(s, "", true)
 	if js[0].Status != "lost" || status(t, s, id).Status != "lost" {
 		t.Fatalf("unlocked live pid not lost: %+v", js[0])
 	}
 	// Stop on a lost job does not signal (it would hit this test process).
-	if j, err := Stop(s, id); err != nil || j.Status != "lost" {
+	if j, err := Stop(s, id, "", false); err != nil || j.Status != "lost" {
 		t.Fatalf("stop lost: %v %+v", err, j)
 	}
 }
@@ -321,7 +321,7 @@ func TestLockLiveness(t *testing.T) {
 func TestEmptyRef(t *testing.T) {
 	s := newStore(t)
 	id := mkJob(t, s, fakeSpec(fake{}), "starting") // unnamed
-	if _, err := Stop(s, ""); !errors.Is(err, store.ErrNotFound) {
+	if _, err := Stop(s, "", "", false); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("stop \"\": %v", err)
 	}
 	if st := status(t, s, id).Status; st != "starting" {
@@ -404,5 +404,86 @@ func TestAppendGivesUpFailsJob(t *testing.T) {
 	}
 	if got := texts(t, s, id); len(got) != 0 {
 		t.Fatalf("partial batch stored: %q", got)
+	}
+}
+
+// Names are scoped to owners: two owners start "web" concurrently (real workers); reads and stops by
+// name hit only the caller's own job, and stopping another owner's job by id needs force.
+func TestOwnersSameName(t *testing.T) {
+	s := newStore(t)
+	owners := []string{"thread-a", "thread-b"}
+	ids := make([]string, len(owners))
+	var wg sync.WaitGroup
+	errs := make(chan error, len(owners))
+	for i, o := range owners {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			j, err := Start(s, StartOpts{Name: "web", Owner: o, Spec: fakeSpec(fake{Batches: [][]string{{"hello from " + o}}, Hold: true})})
+			if err != nil {
+				errs <- err
+				return
+			}
+			ids[i] = j.ID
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		for _, id := range ids {
+			Stop(s, id, "", true)
+		}
+	})
+
+	for i, o := range owners {
+		j, err := s.GetJob("web", o)
+		if err != nil || j.ID != ids[i] || j.Owner != o {
+			t.Fatalf("%s: GetJob(web) = %+v, %v; want %s", o, j, err, ids[i])
+		}
+		for end := time.Now().Add(3 * time.Second); len(texts(t, s, j.ID)) < 1; time.Sleep(50 * time.Millisecond) {
+			if time.Now().After(end) {
+				t.Fatalf("%s: no lines", o)
+			}
+		}
+		if got := texts(t, s, j.ID); len(got) != 1 || got[0] != "hello from "+o {
+			t.Fatalf("%s reads %q", o, got)
+		}
+		if js, _ := List(s, o, false); len(js) != 1 || js[0].ID != ids[i] {
+			t.Fatalf("%s lists %+v", o, js)
+		}
+	}
+	if js, _ := List(s, "", true); len(js) != 2 {
+		t.Fatalf("all: %+v", js)
+	}
+	if _, err := s.GetJob("web", "thread-c"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("a third owner resolves web: %v", err)
+	}
+
+	// Across owners by id: refused without force, and the error names the owner.
+	if _, err := Stop(s, ids[0], "thread-b", false); err == nil || !strings.Contains(err.Error(), `"thread-a"`) {
+		t.Fatalf("cross-owner stop: %v", err)
+	}
+	if st := status(t, s, ids[0]).Status; st != "running" {
+		t.Fatalf("a's job %s after refused stop", st)
+	}
+	// By name: b stops only its own.
+	j, err := Stop(s, "web", "thread-b", false)
+	if err != nil || j.ID != ids[1] || j.Status != "stopped" {
+		t.Fatalf("b stops web: %+v %v", j, err)
+	}
+	if st := status(t, s, ids[0]).Status; st != "running" {
+		t.Fatalf("a's job %s after b stopped its own", st)
+	}
+	if j, err := Stop(s, ids[0], "thread-b", true); err != nil || j.Status != "stopped" {
+		t.Fatalf("forced stop: %+v %v", j, err)
+	}
+
+	// The shared namespace (owner "") can be stopped by anyone.
+	shared := mkJob(t, s, fakeSpec(fake{}), "exited")
+	if _, err := Stop(s, shared, "thread-a", false); err != nil {
+		t.Fatalf("stop shared job: %v", err)
 	}
 }

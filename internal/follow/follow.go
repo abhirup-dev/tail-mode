@@ -3,11 +3,15 @@ package follow
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
@@ -29,6 +33,9 @@ type Options struct {
 var (
 	minEvery  = 5 * time.Second
 	waitEvery = time.Second
+	// registerWait is how long StartNotifier waits for the new follower to take over (its lock retry is 2 s).
+	registerWait = 4 * time.Second
+	stopWait     = 3 * time.Second // SIGTERM → SIGKILL for a replaced follower
 	// finalRetry paces the final digest's retries: 2 s, 5 s, 10 s.
 	finalRetry = func() backoff.BackOff {
 		return backoff.WithMaxRetries(backoff.NewExponentialBackOff(
@@ -46,7 +53,7 @@ const (
 // liveStatus refreshes job with its effective status (jobs.Status) and reports whether it has not ended.
 // "lost" counts as ended.
 func liveStatus(s *store.Store, job *store.Job) (running bool, err error) {
-	j, err := s.GetJob(job.ID)
+	j, err := s.GetJob(job.ID, "")
 	if err != nil {
 		return false, err
 	}
@@ -218,8 +225,61 @@ type NotifierOpts struct {
 	Deliver  string
 }
 
-// StartNotifier detaches a `tail-mode follow` process for job and returns its pid.
-func StartNotifier(job string, o NotifierOpts) (int, error) {
+// NotifierLock is the liveness lock of the follower for (job, deliver): <dir>/run/n-<job>-<hash>.lock.
+// The deliver spec is hashed since it holds colons and thread ids.
+func NotifierLock(s *store.Store, job, deliver string) string {
+	h := sha256.Sum256([]byte(deliver))
+	return filepath.Join(s.Dir, "run", "n-"+job+"-"+hex.EncodeToString(h[:6])+".lock")
+}
+
+// Register makes the calling process the one notifier for (job, deliver): it takes the notifier lock
+// (failing if another live follower keeps holding it) and records its pid. release deletes the row
+// (if it is still ours) and unlocks. Only followers started by StartNotifier register; plain
+// `tail-mode follow` (Monitor recipes, Pi) is per-session and never deduplicated.
+func Register(s *store.Store, job, deliver string) (release func(), err error) {
+	unlock, err := proc.Lock(NotifierLock(s, job, deliver))
+	if err != nil {
+		return nil, fmt.Errorf("another notifier for %s → %s is running: %w", job, deliver, err)
+	}
+	pid := os.Getpid()
+	if err := s.SetNotifier(job, deliver, pid); err != nil {
+		unlock()
+		return nil, err
+	}
+	return func() {
+		_ = s.DeleteNotifier(job, deliver, pid)
+		unlock()
+	}, nil
+}
+
+// stopNotifier ends the live follower for (job, deliver), if any. Like a job worker, it is signalled
+// only while it holds its lock, so the recorded pid is still ours.
+func stopNotifier(s *store.Store, job, deliver string) error {
+	n, ok, err := s.GetNotifier(job, deliver)
+	if err != nil || !ok || n.PID <= 0 {
+		return err
+	}
+	lock := NotifierLock(s, job, deliver)
+	if !proc.Locked(lock) {
+		return nil
+	}
+	// shortcut: a successor that has locked but not yet written its row leaves a stale pid for a few
+	// ms; signalling it is harmless unless that pid was recycled in between.
+	_ = syscall.Kill(n.PID, syscall.SIGTERM)
+	if proc.WaitUnlocked(lock, stopWait) {
+		return nil
+	}
+	_ = syscall.Kill(n.PID, syscall.SIGKILL)
+	if !proc.WaitUnlocked(lock, time.Second) {
+		return fmt.Errorf("previous notifier pid %d for %s → %s did not stop", n.PID, job, deliver)
+	}
+	return nil
+}
+
+// StartNotifier makes a detached `tail-mode follow` process the one notifier for (job, o.Deliver):
+// a live follower for the same job and destination is stopped first (followers for other
+// destinations are left alone). It returns once the new follower has registered, with its pid.
+func StartNotifier(s *store.Store, job string, o NotifierOpts) (int, error) {
 	if o.Deliver == "" {
 		return 0, errors.New("notifier: no deliver spec")
 	}
@@ -229,7 +289,10 @@ func StartNotifier(job string, o NotifierOpts) (int, error) {
 	if _, err := regexp.Compile(o.Match); err != nil {
 		return 0, err
 	}
-	args := []string{"follow", "--deliver=" + o.Deliver, "--after=" + strconv.FormatInt(o.After, 10)}
+	if err := stopNotifier(s, job, o.Deliver); err != nil {
+		return 0, err
+	}
+	args := []string{"follow", "--notifier", "--deliver=" + o.Deliver, "--after=" + strconv.FormatInt(o.After, 10)}
 	if o.Every > 0 {
 		args = append(args, "--every="+o.Every.String())
 	}
@@ -239,5 +302,21 @@ func StartNotifier(job string, o NotifierOpts) (int, error) {
 	if o.Match != "" {
 		args = append(args, "--match="+o.Match)
 	}
-	return proc.Detach(append(args, "--", job)...)
+	pid, err := proc.Detach(append(args, "--", job)...)
+	if err != nil {
+		return 0, err
+	}
+	for end := time.Now().Add(registerWait); ; time.Sleep(25 * time.Millisecond) {
+		n, ok, err := s.GetNotifier(job, o.Deliver)
+		if err != nil {
+			return pid, err
+		}
+		if ok && n.PID == pid {
+			return pid, nil
+		}
+		if time.Now().After(end) {
+			return pid, fmt.Errorf("notifier pid %d did not start (another notifier for %s → %s may have taken over); see %s",
+				pid, job, o.Deliver, filepath.Join(s.Dir, "proc.log"))
+		}
+	}
 }

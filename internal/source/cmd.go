@@ -106,8 +106,15 @@ func (c command) Describe() string       { return c.Cmd }
 func (c command) RestartByDefault() bool { return false }
 
 // LocalDefaults records the caller's cwd as the working dir when none (or a relative one) is given.
+// With cwd "" (caller's dir unknown) such a dir is an ErrNeedAbsolute error.
 func (c command) LocalDefaults(cwd string) (any, error) {
 	if rel, _ := homeRel(c.Dir); rel == nil && !filepath.IsAbs(c.Dir) {
+		if cwd == "" {
+			if c.Dir == "" {
+				return nil, fmt.Errorf("%w: cmd has no dir", ErrNeedAbsolute)
+			}
+			return nil, fmt.Errorf("%w: cmd dir %q is relative", ErrNeedAbsolute, c.Dir)
+		}
 		c.Dir = filepath.Join(cwd, c.Dir)
 	}
 	return c.CmdConfig, nil

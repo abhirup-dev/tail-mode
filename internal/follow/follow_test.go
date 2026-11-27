@@ -68,7 +68,7 @@ func setup(t *testing.T, live bool) (*store.Store, store.Job) {
 	if ok, err := s.Claim(j.ID, os.Getpid()); !ok || err != nil {
 		t.Fatalf("claim: %v %v", ok, err)
 	}
-	j, _ = s.GetJob(j.ID)
+	j, _ = s.GetJob(j.ID, "")
 	return s, j
 }
 

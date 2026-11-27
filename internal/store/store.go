@@ -43,6 +43,7 @@ var ErrNotFound = errors.New("job not found")
 type Job struct {
 	ID        string `json:"id"`
 	Name      string `json:"name,omitempty"`
+	Owner     string `json:"owner,omitempty"`  // T3 thread id or free label; "" = shared namespace
 	Kind      string `json:"kind"`             // source kind
 	Transport string `json:"transport"`        // "local" | "ssh"
 	Target    string `json:"target,omitempty"` // ssh host
@@ -83,7 +84,7 @@ func Dir() string {
 
 const schema = `
 CREATE TABLE IF NOT EXISTS jobs(
-  id TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL, transport TEXT NOT NULL,
+  id TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '', owner TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL, transport TEXT NOT NULL,
   target TEXT NOT NULL DEFAULT '', spec TEXT NOT NULL, describe TEXT NOT NULL DEFAULT '',
   pid INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, started_at INTEGER NOT NULL,
   ended_at INTEGER NOT NULL DEFAULT 0, exit_code INTEGER NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '');
@@ -93,7 +94,33 @@ CREATE INDEX IF NOT EXISTS lines_job ON lines(job, id);
 CREATE VIRTUAL TABLE IF NOT EXISTS lines_fts USING fts5(text, content='lines', content_rowid='id', tokenize='porter unicode61');
 CREATE TRIGGER IF NOT EXISTS lines_ai AFTER INSERT ON lines BEGIN INSERT INTO lines_fts(rowid, text) VALUES (new.id, new.text); END;
 CREATE TRIGGER IF NOT EXISTS lines_ad AFTER DELETE ON lines BEGIN INSERT INTO lines_fts(lines_fts, rowid, text) VALUES ('delete', old.id, old.text); END;
+CREATE TABLE IF NOT EXISTS notifiers(job TEXT NOT NULL, deliver TEXT NOT NULL, pid INTEGER NOT NULL, started_at INTEGER NOT NULL,
+  PRIMARY KEY(job, deliver));
 `
+
+// postMigrate runs after migrate, since it needs columns that old DBs only get there.
+const postMigrate = `CREATE INDEX IF NOT EXISTS jobs_owner_name ON jobs(owner, name, started_at);`
+
+// migrate brings a DB created by an older version up to date. Every process opens the DB, so the
+// check and the ALTER run in one IMMEDIATE transaction: concurrent openers serialize, and the loser
+// sees the column and does nothing.
+func migrate(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var n int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('jobs') WHERE name='owner'`).Scan(&n); err != nil {
+		return err
+	}
+	if n == 0 {
+		if _, err := tx.Exec(`ALTER TABLE jobs ADD COLUMN owner TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
 
 // Open opens (creating if needed) the DB in dir ("" = Dir()).
 func Open(dir string) (*Store, error) {
@@ -112,6 +139,14 @@ func Open(dir string) (*Store, error) {
 		return nil, err
 	}
 	if _, err := db.Exec(schema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("init schema: %w", err)
+	}
+	if err := migrate(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate: %w", err)
+	}
+	if _, err := db.Exec(postMigrate); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("init schema: %w", err)
 	}
@@ -135,8 +170,8 @@ func NewJobID() string {
 
 // CreateJob inserts j. Callers pass Status "starting" and PID 0; the worker claims it.
 func (s *Store) CreateJob(j Job) error {
-	_, err := s.db.Exec(`INSERT INTO jobs(id,name,kind,transport,target,spec,describe,pid,status,started_at) VALUES(?,?,?,?,?,?,?,?,?,?)`,
-		j.ID, j.Name, j.Kind, j.Transport, j.Target, j.Spec, j.Describe, j.PID, j.Status, j.StartedAt)
+	_, err := s.db.Exec(`INSERT INTO jobs(id,name,owner,kind,transport,target,spec,describe,pid,status,started_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+		j.ID, j.Name, j.Owner, j.Kind, j.Transport, j.Target, j.Spec, j.Describe, j.PID, j.Status, j.StartedAt)
 	return err
 }
 
@@ -170,30 +205,36 @@ func (s *Store) Finish(id, status string, exitCode int, errMsg string, force boo
 	return err
 }
 
-const jobCols = `id,name,kind,transport,target,spec,describe,pid,status,started_at,ended_at,exit_code,error`
+const jobCols = `id,name,owner,kind,transport,target,spec,describe,pid,status,started_at,ended_at,exit_code,error`
 
 func scanJob(sc interface{ Scan(...any) error }) (Job, error) {
 	var j Job
-	err := sc.Scan(&j.ID, &j.Name, &j.Kind, &j.Transport, &j.Target, &j.Spec, &j.Describe, &j.PID, &j.Status, &j.StartedAt, &j.EndedAt, &j.ExitCode, &j.Error)
+	err := sc.Scan(&j.ID, &j.Name, &j.Owner, &j.Kind, &j.Transport, &j.Target, &j.Spec, &j.Describe, &j.PID, &j.Status, &j.StartedAt, &j.EndedAt, &j.ExitCode, &j.Error)
 	return j, err
 }
 
-// GetJob finds a job by id, else the latest job with that (non-empty) name.
-func (s *Store) GetJob(ref string) (Job, error) {
+// GetJob finds a job by id (any owner), else the latest job with that (non-empty) name owned by owner.
+// Names are scoped to their owner, so the same name under two owners never collides; callers that
+// hold an id pass owner "".
+func (s *Store) GetJob(ref, owner string) (Job, error) {
 	if ref == "" {
 		return Job{}, fmt.Errorf("%w: empty job reference", ErrNotFound)
 	}
-	j, err := scanJob(s.db.QueryRow(`SELECT `+jobCols+` FROM jobs WHERE id=? OR (name<>'' AND name=?)
-		ORDER BY id=? DESC, started_at DESC, rowid DESC LIMIT 1`, ref, ref, ref))
+	j, err := scanJob(s.db.QueryRow(`SELECT `+jobCols+` FROM jobs WHERE id=? OR (name<>'' AND name=? AND owner=?)
+		ORDER BY id=? DESC, started_at DESC, rowid DESC LIMIT 1`, ref, ref, owner, ref))
 	if errors.Is(err, sql.ErrNoRows) {
+		if owner != "" {
+			return j, fmt.Errorf("%w: %s (names are looked up among owner %q's jobs; use the job id for another owner's job)", ErrNotFound, ref, owner)
+		}
 		return j, fmt.Errorf("%w: %s", ErrNotFound, ref)
 	}
 	return j, err
 }
 
-// ListJobs returns all jobs, newest first, with line stats. It does not check pid liveness (jobs.List does).
-func (s *Store) ListJobs() ([]Job, error) {
-	rows, err := s.db.Query(`SELECT ` + jobCols + ` FROM jobs ORDER BY started_at DESC`)
+// ListJobs returns owner's jobs (all owners' if all), newest first, with line stats. It does not check
+// pid liveness (jobs.List does).
+func (s *Store) ListJobs(owner string, all bool) ([]Job, error) {
+	rows, err := s.db.Query(`SELECT `+jobCols+` FROM jobs WHERE ? OR owner=? ORDER BY started_at DESC`, all, owner)
 	if err != nil {
 		return nil, err
 	}
@@ -320,9 +361,11 @@ func (s *Store) Read(q ReadQuery) ([]Line, error) {
 
 type SearchQuery struct {
 	Query   string // FTS5 query; falls back to a quoted phrase if the syntax is invalid
-	Job     string // optional job id
-	SinceTS int64  // optional, unix ms
-	Limit   int    // default 50
+	Job     string // optional job id; when set, Owner/All are ignored
+	Owner   string // only jobs of this owner, unless All
+	All     bool
+	SinceTS int64 // optional, unix ms
+	Limit   int   // default 50
 }
 
 // Search returns FTS matches newest first.
@@ -332,8 +375,9 @@ func (s *Store) Search(q SearchQuery) ([]Line, error) {
 	}
 	run := func(match string) ([]Line, error) {
 		rows, err := s.db.Query(`SELECT l.id,l.job,l.ts,l.text FROM lines_fts f JOIN lines l ON l.id=f.rowid
-			WHERE lines_fts MATCH ? AND (?='' OR l.job=?) AND l.ts>=? ORDER BY l.id DESC LIMIT ?`,
-			match, q.Job, q.Job, q.SinceTS, q.Limit)
+			WHERE lines_fts MATCH ? AND (?='' OR l.job=?) AND l.ts>=?
+			  AND (?<>'' OR ? OR l.job IN (SELECT id FROM jobs WHERE owner=?)) ORDER BY l.id DESC LIMIT ?`,
+			match, q.Job, q.Job, q.SinceTS, q.Job, q.All, q.Owner, q.Limit)
 		if err != nil {
 			return nil, err
 		}
@@ -355,4 +399,54 @@ func (s *Store) Search(q SearchQuery) ([]Line, error) {
 		}
 	}
 	return out, err
+}
+
+// Notifier is a registered detached follower: one per (job, deliver), see follow.StartNotifier.
+type Notifier struct {
+	Job       string `json:"job"`
+	Deliver   string `json:"deliver"`
+	PID       int    `json:"pid"`
+	StartedAt int64  `json:"started_at"`
+}
+
+// SetNotifier records pid as the follower for (job, deliver), replacing any earlier row.
+func (s *Store) SetNotifier(job, deliver string, pid int) error {
+	_, err := s.db.Exec(`INSERT INTO notifiers(job,deliver,pid,started_at) VALUES(?,?,?,?)
+		ON CONFLICT(job,deliver) DO UPDATE SET pid=excluded.pid, started_at=excluded.started_at`, job, deliver, pid, NowMS())
+	return err
+}
+
+// DeleteNotifier removes the (job, deliver) row if it still names pid (a successor may own it).
+func (s *Store) DeleteNotifier(job, deliver string, pid int) error {
+	_, err := s.db.Exec(`DELETE FROM notifiers WHERE job=? AND deliver=? AND pid=?`, job, deliver, pid)
+	return err
+}
+
+// GetNotifier returns the (job, deliver) row; ok is false if there is none.
+func (s *Store) GetNotifier(job, deliver string) (n Notifier, ok bool, err error) {
+	err = s.db.QueryRow(`SELECT job,deliver,pid,started_at FROM notifiers WHERE job=? AND deliver=?`, job, deliver).
+		Scan(&n.Job, &n.Deliver, &n.PID, &n.StartedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return n, false, nil
+	}
+	return n, err == nil, err
+}
+
+// ListNotifiers returns job's notifier rows ("" = all jobs). Rows of dead followers may linger until
+// replaced; check liveness with the notifier lock.
+func (s *Store) ListNotifiers(job string) ([]Notifier, error) {
+	rows, err := s.db.Query(`SELECT job,deliver,pid,started_at FROM notifiers WHERE ?='' OR job=? ORDER BY job, deliver`, job, job)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Notifier
+	for rows.Next() {
+		var n Notifier
+		if err := rows.Scan(&n.Job, &n.Deliver, &n.PID, &n.StartedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, n)
+	}
+	return out, rows.Err()
 }

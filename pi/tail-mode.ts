@@ -69,6 +69,12 @@ function parse<T>(r: Result): T | string {
 
 const hhmmss = (ts: number) => new Date(ts).toTimeString().slice(0, 8);
 
+// OWNER is the owner param every tool takes. Unset, the CLI uses its default ($T3CODE_THREAD_ID, else the
+// shared namespace), which Pi's child processes inherit.
+const OWNER = Type.Optional(Type.String({
+  description: "Job owner: names resolve among its jobs and new jobs get it (default $T3CODE_THREAD_ID, else shared)",
+}));
+
 function flags(pairs: Record<string, string | number | undefined>): string[] {
   const out: string[] = [];
   for (const [k, v] of Object.entries(pairs)) if (v !== undefined && v !== "") out.push(`--${k}`, String(v));
@@ -84,9 +90,10 @@ export default function tailMode(pi: ExtensionAPI): void {
     if (c) { followers.delete(id); c.kill("SIGTERM"); }
   };
 
-  // resolve maps a job id or name to its id (latest job with that name), like the CLI does.
-  const resolve = async (ref: string, signal?: AbortSignal): Promise<string> => {
-    const js = parse<Job[]>(await run(["jobs"], signal));
+  // resolve maps a job id or name to its id (owner's latest job with that name), like the CLI does.
+  // Another owner's id is not listed and is returned unchanged.
+  const resolve = async (ref: string, owner: string | undefined, signal?: AbortSignal): Promise<string> => {
+    const js = parse<Job[]>(await run(["jobs", ...flags({ owner })], signal));
     if (typeof js === "string" || !Array.isArray(js)) return ref;
     if (js.some((j) => j.id === ref)) return ref;
     const named = js.filter((j) => j.name === ref).sort((a, b) => (b.started_at ?? 0) - (a.started_at ?? 0));
@@ -167,6 +174,7 @@ export default function tailMode(pi: ExtensionAPI): void {
       restart: Type.Optional(Type.Boolean({ description: "Restart when the source ends (default: file yes, cmd no)" })),
       notify_every: Type.Optional(Type.String({ description: "Digest interval, e.g. 30s" })),
       notify_match: Type.Optional(Type.String({ description: "Only notify on lines matching this regex" })),
+      owner: OWNER,
     }),
     async execute(_id, p, signal) {
       const srcs = [p.file, p.cmd, p.source].filter((v) => v !== undefined && v !== "").length;
@@ -179,7 +187,7 @@ export default function tailMode(pi: ExtensionAPI): void {
       // The CLI fills in local defaults (cwd as the cmd dir, absolute file paths) from its own cwd, which is Pi's.
       const args = ["start", ...flags({
         name: p.name, host: p.host, transport: p.transport, target: p.target, backlog: p.backlog,
-        dir: p.dir, shell: p.shell,
+        dir: p.dir, shell: p.shell, owner: p.owner,
       })];
       for (const [k, v] of env) args.push("--env", `${k}=${v}`);
       if (p.login) args.push("--login");
@@ -202,21 +210,29 @@ export default function tailMode(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "tail_stop",
     label: "Tail stop",
-    description: "Stop a tail-mode job (and its notifier).",
-    parameters: Type.Object({ job: Type.String({ description: "Job id or name" }) }),
+    description: "Stop one of your tail-mode jobs (and its notifier). Another owner's job is refused unless force.",
+    parameters: Type.Object({
+      job: Type.String({ description: "Job id or name (a name means your newest job with it)" }),
+      force: Type.Optional(Type.Boolean({ description: "Stop it even if it is another owner's job" })),
+      owner: OWNER,
+    }),
     async execute(_id, p, signal) {
-      stopFollower(await resolve(p.job, signal));
-      return text(clip((await run(["stop", p.job], signal)).out, MAX_OUT));
+      const r = await run(["stop", p.job, ...flags({ owner: p.owner }), ...(p.force ? ["--force"] : [])], signal);
+      if (r.ok) stopFollower(await resolve(p.job, p.owner, signal));
+      return text(clip(r.out, MAX_OUT));
     },
   });
 
   pi.registerTool({
     name: "tail_jobs",
     label: "Tail jobs",
-    description: "List tail-mode jobs with status and line counts.",
-    parameters: Type.Object({}),
-    async execute(_id, _p, signal) {
-      return text(clip((await run(["jobs"], signal)).out, MAX_OUT));
+    description: "List your tail-mode jobs (all: every owner's) with status and line counts.",
+    parameters: Type.Object({
+      all: Type.Optional(Type.Boolean({ description: "Every owner's jobs, not just yours" })),
+      owner: OWNER,
+    }),
+    async execute(_id, p, signal) {
+      return text(clip((await run(["jobs", ...flags({ owner: p.owner }), ...(p.all ? ["--all"] : [])], signal)).out, MAX_OUT));
     },
   });
 
@@ -230,10 +246,11 @@ export default function tailMode(pi: ExtensionAPI): void {
       tail: Type.Optional(Type.Number()),
       grep: Type.Optional(Type.String()),
       limit: Type.Optional(Type.Number({ description: "default 200" })),
+      owner: OWNER,
     }),
     async execute(_id, p, signal) {
       const limit = p.limit ?? 200;
-      const ls = parse<Line[]>(await run(["read", p.job, ...flags({ after: p.after, tail: p.tail, grep: p.grep, limit })], signal));
+      const ls = parse<Line[]>(await run(["read", p.job, ...flags({ after: p.after, tail: p.tail, grep: p.grep, limit, owner: p.owner })], signal));
       if (typeof ls === "string") return text(ls);
       const rows = ls.map((l) => `${l.id} ${hhmmss(l.ts)} ${l.text}`);
       return text(render(`${DATA_NOTE} [tail-mode] ${p.job} · ${ls.length} lines`, rows, (shown) => {
@@ -250,15 +267,18 @@ export default function tailMode(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "tail_search",
     label: "Tail search",
-    description: `Full-text (FTS5) search over captured lines, newest first. ${DATA_NOTE}`,
+    description: `Full-text (FTS5) search over your jobs' lines (all: every owner's), newest first. ${DATA_NOTE}`,
     parameters: Type.Object({
       query: Type.String(),
       job: Type.Optional(Type.String({ description: "Job id or name" })),
+      all: Type.Optional(Type.Boolean({ description: "Every owner's jobs, not just yours" })),
       since: Type.Optional(Type.String({ description: "e.g. 1h" })),
       limit: Type.Optional(Type.Number({ description: "default 50" })),
+      owner: OWNER,
     }),
     async execute(_id, p, signal) {
-      const ls = parse<Line[]>(await run(["search", p.query, ...flags({ job: p.job, since: p.since, limit: p.limit })], signal));
+      const args = ["search", p.query, ...flags({ job: p.job, since: p.since, limit: p.limit, owner: p.owner }), ...(p.all ? ["--all"] : [])];
+      const ls = parse<Line[]>(await run(args, signal));
       if (typeof ls === "string") return text(ls);
       const rows = ls.map((l) => `${l.id} ${l.job} ${hhmmss(l.ts)} ${l.text}`);
       return text(render(`${DATA_NOTE} [tail-mode] search (newest first) · ${ls.length} lines`, rows, (shown) =>
@@ -271,7 +291,7 @@ export default function tailMode(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "tail_sql",
     label: "Tail SQL",
-    description: `Read-only SQL (one SELECT, 5 s limit) over the tail-mode store (tables: jobs, lines(id,job,ts,text)). ${DATA_NOTE}`,
+    description: `Read-only SQL (one SELECT, 5 s limit) over the tail-mode store (tables: jobs(id,name,owner,…), lines(id,job,ts,text), notifiers); not owner-scoped. ${DATA_NOTE}`,
     parameters: Type.Object({ query: Type.String(), limit: Type.Optional(Type.Number({ description: "default 500" })) }),
     async execute(_id, p, signal) {
       const limit = p.limit ?? 500;
@@ -300,9 +320,10 @@ export default function tailMode(pi: ExtensionAPI): void {
       every: Type.Optional(Type.String({ description: "default 30s" })),
       match: Type.Optional(Type.String({ description: "Only notify on matching lines" })),
       after: Type.Optional(Type.Number({ description: "Start after this cursor (default: from now; 0 = from the start)" })),
+      owner: OWNER,
     }),
     async execute(_id, p, signal) {
-      return text(await follow(await resolve(p.job, signal), p.every || "30s", p.match, p.after));
+      return text(await follow(await resolve(p.job, p.owner, signal), p.every || "30s", p.match, p.after));
     },
   });
 }

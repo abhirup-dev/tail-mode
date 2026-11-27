@@ -37,6 +37,7 @@ var (
 
 type StartOpts struct {
 	Name      string
+	Owner     string // "" = shared namespace
 	Transport string // "" = local
 	Target    string
 	Spec      source.Spec
@@ -64,7 +65,7 @@ func Start(s *store.Store, o StartOpts) (store.Job, error) {
 	if t.Target() != "" {
 		desc = t.Target() + ": " + desc
 	}
-	j := store.Job{ID: store.NewJobID(), Name: o.Name, Kind: o.Spec.Kind, Transport: t.Name(), Target: t.Target(),
+	j := store.Job{ID: store.NewJobID(), Name: o.Name, Owner: o.Owner, Kind: o.Spec.Kind, Transport: t.Name(), Target: t.Target(),
 		Spec: string(spec), Describe: desc, Status: "starting", StartedAt: store.NowMS()}
 	if err := s.CreateJob(j); err != nil {
 		return j, err
@@ -74,7 +75,7 @@ func Start(s *store.Store, o StartOpts) (store.Job, error) {
 		return j, err
 	}
 	for end := time.Now().Add(claimWait); ; time.Sleep(25 * time.Millisecond) {
-		cur, err := s.GetJob(j.ID)
+		cur, err := s.GetJob(j.ID, "")
 		if err != nil || cur.Status != "starting" || time.Now().After(end) {
 			return cur, err
 		}
@@ -91,7 +92,7 @@ func Status(s *store.Store, j store.Job) string {
 		return j.Status
 	}
 	// The worker finishes its row before releasing the lock, so a fresh read settles a stale j.
-	if cur, err := s.GetJob(j.ID); err == nil && cur.Status != j.Status {
+	if cur, err := s.GetJob(j.ID, ""); err == nil && cur.Status != j.Status {
 		return Status(s, cur)
 	}
 	if j.Status == "starting" && time.Since(time.UnixMilli(j.StartedAt)) < startingGrace {
@@ -100,9 +101,9 @@ func Status(s *store.Store, j store.Job) string {
 	return "lost"
 }
 
-// List returns jobs newest first, persisting lost ones.
-func List(s *store.Store) ([]store.Job, error) {
-	js, err := s.ListJobs()
+// List returns owner's jobs (every owner's if all) newest first, persisting lost ones.
+func List(s *store.Store, owner string, all bool) ([]store.Job, error) {
+	js, err := s.ListJobs(owner, all)
 	if err != nil {
 		return nil, err
 	}
@@ -114,7 +115,7 @@ func List(s *store.Store) ([]store.Job, error) {
 		if st == "lost" {
 			_ = s.Finish(j.ID, "lost", 0, "", false)
 		}
-		if cur, err := s.GetJob(j.ID); err == nil {
+		if cur, err := s.GetJob(j.ID, ""); err == nil {
 			js[i].Status, js[i].EndedAt, js[i].ExitCode, js[i].Error = cur.Status, cur.EndedAt, cur.ExitCode, cur.Error
 		}
 	}
@@ -124,10 +125,15 @@ func List(s *store.Store) ([]store.Job, error) {
 // Stop stops a job. A starting job is marked stopped (its worker's claim then fails and it exits).
 // A running job's worker is signalled only while it holds the lock (so the pid is ours):
 // SIGTERM, wait ≤ 3 s, then SIGKILL its process group.
-func Stop(s *store.Store, ref string) (store.Job, error) {
-	j, err := s.GetJob(ref)
+// ref is resolved for owner (ids match any owner, names only owner's). A job of another non-empty
+// owner is refused unless force; jobs in the shared namespace (owner "") can be stopped by anyone.
+func Stop(s *store.Store, ref, owner string, force bool) (store.Job, error) {
+	j, err := s.GetJob(ref, owner)
 	if err != nil {
 		return j, err
+	}
+	if j.Owner != "" && j.Owner != owner && !force {
+		return j, fmt.Errorf("job %s belongs to owner %q, not you (owner %q); pass force (CLI: --force) to stop it anyway", j.ID, j.Owner, owner)
 	}
 	if j.Status == "starting" {
 		ok, err := s.Abort(j.ID)
@@ -135,9 +141,9 @@ func Stop(s *store.Store, ref string) (store.Job, error) {
 			return j, err
 		}
 		if ok {
-			return s.GetJob(j.ID)
+			return s.GetJob(j.ID, "")
 		}
-		if j, err = s.GetJob(j.ID); err != nil { // claimed meanwhile
+		if j, err = s.GetJob(j.ID, ""); err != nil { // claimed meanwhile
 			return j, err
 		}
 	}
@@ -158,17 +164,10 @@ func Stop(s *store.Store, ref string) (store.Job, error) {
 	if err := s.Finish(j.ID, "stopped", 0, "", false); err != nil {
 		return j, err
 	}
-	return s.GetJob(j.ID)
+	return s.GetJob(j.ID, "")
 }
 
-func waitUnlocked(lock string, d time.Duration) bool {
-	for end := time.Now().Add(d); proc.Locked(lock); time.Sleep(50 * time.Millisecond) {
-		if time.Now().After(end) {
-			return false
-		}
-	}
-	return true
-}
+func waitUnlocked(lock string, d time.Duration) bool { return proc.WaitUnlocked(lock, d) }
 
 // Run is the _job worker: lock, claim, then run the source loop. SIGTERM/SIGINT stop it.
 // If the claim fails (stopped while starting) it exits cleanly without running.
@@ -199,7 +198,7 @@ func retryWrite(ctx context.Context, budget time.Duration, what string, op func(
 }
 
 func run(ctx context.Context, s *store.Store, id string) error {
-	j, err := s.GetJob(id)
+	j, err := s.GetJob(id, "")
 	if err != nil {
 		return err
 	}

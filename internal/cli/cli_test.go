@@ -155,3 +155,20 @@ func TestReadAndSQL(t *testing.T) {
 		t.Fatal("sql must be read-only")
 	}
 }
+
+// --owner defaults to $T3CODE_THREAD_ID (parse only: nothing runs), and --owner= selects the shared namespace.
+func TestOwnerFlag(t *testing.T) {
+	t.Setenv("T3CODE_THREAD_ID", "t-env")
+	if r := mustParse(t, "read", "web"); r.Read.Owner != "t-env" {
+		t.Fatalf("default owner %q", r.Read.Owner)
+	}
+	if r := mustParse(t, "stop", "web", "--owner", "x", "--force"); r.Stop.Owner != "x" || !r.Stop.Force {
+		t.Fatalf("stop %+v", r.Stop)
+	}
+	if r := mustParse(t, "jobs", "--owner=", "--all"); r.Jobs.Owner != "" || !r.Jobs.All {
+		t.Fatalf("jobs %+v", r.Jobs)
+	}
+	if r := mustParse(t, "search", "q", "--all"); !r.Search.All || r.Search.Owner != "t-env" {
+		t.Fatalf("search %+v", r.Search)
+	}
+}

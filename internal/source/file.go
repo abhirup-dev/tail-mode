@@ -63,8 +63,12 @@ func (f file) Describe() string       { return "tail -F " + f.Path }
 func (f file) RestartByDefault() bool { return true }
 
 // LocalDefaults makes a relative path absolute against the caller's cwd ("~" paths are left alone).
+// With cwd "" (caller's dir unknown) a relative path is an ErrNeedAbsolute error.
 func (f file) LocalDefaults(cwd string) (any, error) {
 	if rest, _ := homeRel(f.Path); rest == nil && !filepath.IsAbs(f.Path) {
+		if cwd == "" {
+			return nil, fmt.Errorf("%w: file path %q is relative", ErrNeedAbsolute, f.Path)
+		}
 		f.Path = filepath.Join(cwd, f.Path)
 	}
 	return f.FileConfig, nil

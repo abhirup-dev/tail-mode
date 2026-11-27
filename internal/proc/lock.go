@@ -43,3 +43,13 @@ func Locked(path string) bool {
 	}
 	return !ok
 }
+
+// WaitUnlocked waits up to d for path to be unlocked and reports whether it is.
+func WaitUnlocked(path string, d time.Duration) bool {
+	for end := time.Now().Add(d); Locked(path); time.Sleep(50 * time.Millisecond) {
+		if time.Now().After(end) {
+			return false
+		}
+	}
+	return true
+}

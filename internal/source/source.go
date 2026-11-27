@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -53,8 +54,13 @@ type localDefaulter interface {
 	LocalDefaults(cwd string) (any, error)
 }
 
+// ErrNeedAbsolute is returned by LocalDefaults with cwd "" for a local path that would need the
+// caller's working dir (a relative or missing cmd dir, a relative file path).
+var ErrNeedAbsolute = errors.New("needs an absolute path")
+
 // LocalDefaults fills in the defaults that only make sense for a job on the local transport, started by
-// a caller whose working directory is cwd (the detached worker's cwd is not the caller's). Integrations
+// a caller whose working directory is cwd (the detached worker's cwd is not the caller's); cwd "" means
+// unknown, and then anything that would need it is an ErrNeedAbsolute error. Integrations
 // call it when the transport is local; adapters without such defaults return spec unchanged.
 func LocalDefaults(spec Spec, cwd string) (Spec, error) {
 	src, err := New(spec)

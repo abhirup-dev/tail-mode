@@ -30,7 +30,7 @@ func TestStore(t *testing.T) {
 	if err := s.Append("j000001", []string{"ok one", "ERROR db timeout", "ok two", "ERROR again"}, NowMS()); err != nil {
 		t.Fatal(err)
 	}
-	j, err := s.GetJob("web")
+	j, err := s.GetJob("web", "")
 	if err != nil || j.ID != "j000001" {
 		t.Fatalf("GetJob by name: %v %v", j, err)
 	}
@@ -46,7 +46,7 @@ func TestStore(t *testing.T) {
 	if len(g) != 1 || g[0].Text != "ERROR again" {
 		t.Fatalf("grep tail: %+v", g)
 	}
-	jobs, _ := s.ListJobs()
+	jobs, _ := s.ListJobs("", true)
 	if len(jobs) != 1 || jobs[0].Lines != 4 {
 		t.Fatalf("list: %+v", jobs)
 	}
@@ -75,18 +75,18 @@ func TestDriverWALAndFTS(t *testing.T) {
 func TestGetJobEmptyRef(t *testing.T) {
 	s := open(t)
 	s.CreateJob(job("j1", "", "running")) // unnamed
-	if _, err := s.GetJob(""); !errors.Is(err, ErrNotFound) {
+	if _, err := s.GetJob("", ""); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("empty ref: %v", err)
 	}
-	if _, err := s.GetJob("nope"); !errors.Is(err, ErrNotFound) {
+	if _, err := s.GetJob("nope", ""); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("unknown ref: %v", err)
 	}
 	s.CreateJob(job("j2", "web", "exited"))
 	s.CreateJob(job("j3", "web", "running"))
-	if j, _ := s.GetJob("web"); j.ID != "j3" {
+	if j, _ := s.GetJob("web", ""); j.ID != "j3" {
 		t.Fatalf("latest by name: %s", j.ID)
 	}
-	if j, _ := s.GetJob("j2"); j.ID != "j2" {
+	if j, _ := s.GetJob("j2", ""); j.ID != "j2" {
 		t.Fatalf("by id: %s", j.ID)
 	}
 }
@@ -103,7 +103,7 @@ func TestClaimAbortFinish(t *testing.T) {
 	if ok, _ := s.Abort("j1"); ok {
 		t.Fatal("abort after claim must fail")
 	}
-	if j, _ := s.GetJob("j1"); j.Status != "running" || j.PID != 4242 {
+	if j, _ := s.GetJob("j1", ""); j.Status != "running" || j.PID != 4242 {
 		t.Fatalf("claimed: %+v", j)
 	}
 
@@ -122,12 +122,12 @@ func TestClaimAbortFinish(t *testing.T) {
 	s.Finish("j1", "lost", 0, "", false)
 	s.Finish("j2", "lost", 0, "", false)
 	for id, want := range map[string]string{"j1": "exited", "j2": "stopped", "j3": "failed"} {
-		if j, _ := s.GetJob(id); j.Status != want {
+		if j, _ := s.GetJob(id, ""); j.Status != want {
 			t.Fatalf("%s: %s, want %s", id, j.Status, want)
 		}
 	}
 	s.Finish("j1", "stopped", 0, "", true)
-	if j, _ := s.GetJob("j1"); j.Status != "stopped" {
+	if j, _ := s.GetJob("j1", ""); j.Status != "stopped" {
 		t.Fatalf("force: %s", j.Status)
 	}
 }

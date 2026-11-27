@@ -4,6 +4,8 @@ Pi extension exposing `tail_start`, `tail_stop`, `tail_jobs`, `tail_read`, `tail
 Each tool shells out to `tail-mode … --json`. Notifiers (`tail_notify`, or `tail_start` with `notify_every`) run
 `tail-mode follow <job> --deliver jsonl` as a child of Pi and wake the session with a digest message
 (`customType: "tail-mode-digest"`). They stop when the job ends or the Pi session shuts down; the jobs themselves keep running.
+Every tool takes an optional `owner` (passed as `--owner`; unset, the CLI defaults to `$T3CODE_THREAD_ID`): job names
+resolve among that owner's jobs. `tail_jobs`/`tail_search` take `all`, `tail_stop` takes `force`.
 
 ## Install
 

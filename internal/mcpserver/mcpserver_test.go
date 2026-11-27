@@ -38,12 +38,12 @@ func testStore(t *testing.T, lines ...string) *store.Store {
 	return s
 }
 
-// client connects an MCP client to newServer(s) over in-memory transports.
+// client connects an MCP client to newServer(s, false) over in-memory transports.
 func client(t *testing.T, s *store.Store) *mcp.ClientSession {
 	t.Helper()
 	ctx := context.Background()
 	ct, st := mcp.NewInMemoryTransports()
-	ss, err := newServer(s).Connect(ctx, st, nil)
+	ss, err := newServer(s, false).Connect(ctx, st, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +168,7 @@ func stubs(t *testing.T) (*jobs.StartOpts, *[]follow.NotifierOpts) {
 		started = o
 		return store.Job{ID: "j000009", Describe: "tail -F /x"}, nil
 	}
-	startNotifier = func(job string, o follow.NotifierOpts) (int, error) {
+	startNotifier = func(_ *store.Store, job string, o follow.NotifierOpts) (int, error) {
 		if job != "j000009" && job != "j000001" {
 			t.Errorf("notifier for %q", job)
 		}
@@ -198,8 +198,8 @@ func TestStartNotifyFromZero(t *testing.T) {
 	}
 
 	// tail_notify on an existing job starts from now unless after is given.
-	call(t, cs, "tail_notify", map[string]any{"job": "web", "thread": "other"})
-	call(t, cs, "tail_notify", map[string]any{"job": "web", "after": 2})
+	call(t, cs, "tail_notify", map[string]any{"job": "j000001", "thread": "other"})
+	call(t, cs, "tail_notify", map[string]any{"job": "j000001", "after": 2})
 	if n := (*notes)[1]; n.After != -1 || n.Deliver != "t3:other" {
 		t.Fatalf("notify opts %+v", n)
 	}
@@ -210,7 +210,7 @@ func TestStartNotifyFromZero(t *testing.T) {
 
 func TestStartBadNotifyStartsNothing(t *testing.T) {
 	started, _ := stubs(t)
-	if _, err := start(nil, StartIn{Cmd: "x", NotifyMatch: "("}); err == nil || started.Spec.Kind != "" {
+	if _, err := (&server{}).start(StartIn{Cmd: "x", NotifyMatch: "("}); err == nil || started.Spec.Kind != "" {
 		t.Fatalf("err %v, started %+v", err, *started)
 	}
 }
@@ -218,12 +218,12 @@ func TestStartBadNotifyStartsNothing(t *testing.T) {
 func TestNotifyRecipe(t *testing.T) {
 	_, notes := stubs(t)
 	t.Setenv("T3CODE_THREAD_ID", "")
-	out, err := start(nil, StartIn{Cmd: "x", NotifyEvery: "30s", NotifyMatch: "ERR x"})
+	out, err := (&server{}).start(StartIn{Cmd: "x", NotifyEvery: "30s", NotifyMatch: "ERR x"})
 	if err != nil || !strings.Contains(out, "tail-mode follow j000009 --every 30s --match 'ERR x' --after 0") ||
 		!strings.Contains(out, "tail-mode wait j000009 --until RE --timeout 30m --after 0") || len(*notes) != 0 {
 		t.Fatalf("%v\n%s", err, out)
 	}
-	out, err = notify("j000001", 30e9, "", "", -1)
+	out, err = (&server{}).notify("j000001", 30e9, "", "", -1)
 	if err != nil || strings.Contains(out, "--after") {
 		t.Fatalf("%v\n%s", err, out)
 	}
@@ -266,7 +266,7 @@ func TestStartCmdOptionsAndLocalDefaults(t *testing.T) {
 			t.Errorf("want error for %+v", in)
 		}
 	}
-	if _, err := start(nil, StartIn{Cmd: "x", Env: map[string]string{"1A": "v"}}); err == nil {
+	if _, err := (&server{}).start(StartIn{Cmd: "x", Env: map[string]string{"1A": "v"}}); err == nil {
 		t.Error("invalid env name accepted")
 	}
 }
