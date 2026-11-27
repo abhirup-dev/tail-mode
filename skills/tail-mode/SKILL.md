@@ -75,8 +75,8 @@ Pitfalls:
 | Do | MCP / Pi tool | CLI |
 |---|---|---|
 | Run a command | `tail_start {cmd, dir, env?, shell?, login?, host?, name?, notify_every?, notify_match?}` | `tail-mode run [--name N] [--host H] [--dir D] [--env K=V]… [--shell S] [--login] [--every 30s] [--match RE] [--until RE] -- CMD…` |
-| Start | `tail_start {file\|cmd\|source+config, host?\|transport+target?, name?, backlog?, restart?}` | `tail-mode start --file PATH [--backlog N]` / `--cmd 'CMD' [--dir D] [--env K=V]… [--shell S] [--login]` / `--source KIND --config JSON`, plus `[--host H \| --transport T --target X] [--name N] [--restart\|--no-restart]` |
-| Block until ready | `tail_wait {job, until, timeout? (50s, max 5m), after? (0)}` | `tail-mode wait <job> --until RE [--timeout 30m] [--after 0]` |
+| Start | `tail_start {file\|cmd\|source+config, host?, name?, backlog?, restart?}` | `tail-mode start --file PATH [--backlog N]` / `--cmd 'CMD' [--dir D] [--env K=V]… [--shell S] [--login]` / `--source KIND --config JSON`, plus `[--host H \| --transport T --target X] [--name N] [--restart\|--no-restart]` |
+| Block until ready (short waits) | `tail_wait {job, until, timeout? (50s, max 5m), after? (0)}` | `tail-mode wait <job> --until RE [--timeout 30m] [--after 0]` |
 | New lines | `tail_read {job, after: <cursor>}` | `tail-mode read <job> --after ID [--grep RE] [--tail N]` |
 | Search | `tail_search {query, job?, since: "1h"}` | `tail-mode search 'q' [--job J] [--since 1h]` |
 | SQL | `tail_sql {query}` over `jobs`, `lines(id,job,ts,text)` (one SELECT, 5 s) | `tail-mode sql 'select …'` |
@@ -92,26 +92,36 @@ scoped: filter with `jobs.owner` (`tail_jobs` shows yours).
 - Status includes how a job ended: `exited 3` (exit code), `failed: <why>`, `stopped`, `lost` (its
   worker vanished). `tail_jobs` and the `tail_read` header show it, with the line count and the
   last output time.
-- Keep the last `cursor` and pass it as `after` so you only read what is new. When output is cut by
+- Keep the last `cursor` and pass it as `after` so you only read what is new (`after` is exclusive:
+  lines with id > after). When output is cut by
   the budget, `more:` says how many lines were not shown and which `after` continues.
-- `tail_wait` returns the matching lines and a cursor; on timeout it says so and gives the cursor to
+- `tail_wait` is for short waits (< ~1 min); with notifications on, end your turn instead. It returns
+  the matching lines and a cursor; on timeout it says so and gives the cursor to
   wait again from; if the job ends first it gives the exit code and last lines. `after` defaults to 0
   (the job's first line), so a "ready" printed before the call counts.
 - `file` and `cmd` are shorthand for the generic `source` + `config` form:
   `file` → `{"path": "...", "backlog": 50}`, `cmd` → `{"cmd": "...", "dir", "env", "shell", "login"}`.
   `backlog: 0` means no history. On the CLI a relative local `file` path is relative to your current
   dir (the shared MCP server refuses it); `~/x` is the home dir where the job runs (also over ssh).
-- `host` is shorthand for `transport: "ssh", target: host`. Any source runs over any transport.
+- `host` is an ssh host to run on; omit it for local. `dir` and `file` paths are resolved on the
+  target host for host jobs (local paths for local jobs; absolute required in shared mode). Any source
+  runs over ssh. MCP tools take only `host`; the CLI also has the generic `--transport T --target X`.
+- Example: `tail_start {"name": "build", "host": "vps", "dir": "/srv/app", "cmd": "./build.sh",
+  "env": {"MODE": "prod"}, "notify_match": "ERROR|FAIL"}`.
 - `restart` defaults to yes for files, no for commands.
 - Jobs are referred to by id or name. A name means your newest job with that name (only your own
   jobs); an id works for any job. `tail_jobs`/`tail_search` show your jobs; `all: true` shows everyone's.
 - `tail_stop` on a job that already ended is a no-op (`already exited 3 (no-op)`). It refuses another
-  owner's job unless `force: true`; do not force-stop jobs you did not start.
+  owner's job unless `force: true` (CLI: `--force`); do not force-stop jobs you did not start.
 
 ## Getting woken
 
 - **T3 Code**: `tail_start` with `notify_every: "30s"` (and/or `notify_match`), or `tail_notify {job}`.
-  Digests arrive in your own thread as new turns; the last one says how the job ended (`exited 3`).
+  Then **end your turn**: do not sleep, poll, or call `tail_wait`. Each digest arrives in your own
+  thread as a new message and starts your next turn. Running digests say `running`; the last one is
+  unmistakable: `[tail-mode] build FINISHED · exited 3 · 16 lines · last: <the job's last line>`
+  (`FINISHED · failed: <why>`, `FINISHED · stopped`), with the last line shown even if it did not match
+  `notify_match` (labelled `last (not matching /RE/)`). Each digest ends `More: tail_read job=<id> after=<n>`.
   One notifier per job and thread: notifying again replaces the earlier one (no double digests). A
   notifier from `tail_start` starts at the job's first line (backlog included); `tail_notify` starts
   from now unless you pass `after` (0 = from the start). CLI: `tail-mode notify <job> --every 30s
@@ -123,8 +133,9 @@ scoped: filter with `jobs.owner` (`tail_jobs` shows yours).
 - **Pi**: the extension handles `notify_every` / `tail_notify` itself; digests arrive as follow-up turns.
   A notifier that fails to start is reported as an error, not as "notifying".
 
-The jsonl digest (`follow --deliver jsonl`) has `exit_code` (exited jobs) and `error` (failed jobs) on
-the final digest.
+The jsonl digest (`follow --deliver jsonl`) has `final` (true on the last digest) and, on the final
+digest, `exit_code` (exited jobs), `error` (failed jobs), `total_lines`, `last_line` (`{id, ts, text}`,
+matching or not) and `last_matched`.
 
 ## Cost
 
@@ -137,4 +148,4 @@ the final digest.
 
 Planned, not available yet (do not try them): a `tmux` source that captures a pane
 (`source: "tmux", config: {"target": "sess:win.pane"}`), and docker / kubectl exec transports.
-`tail_start` lists the sources and transports this build actually has.
+`tail_start` lists the sources this build actually has.

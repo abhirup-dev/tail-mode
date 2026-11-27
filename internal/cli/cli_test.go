@@ -156,6 +156,23 @@ func TestReadAndSQL(t *testing.T) {
 	}
 }
 
+// The CLI names its flag when refusing another owner's job.
+func TestStopForceWording(t *testing.T) {
+	t.Setenv("TAIL_MODE_HOME", t.TempDir())
+	s, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	j := store.Job{ID: store.NewJobID(), Owner: "a", Kind: "cmd", Transport: "local", Spec: "{}", Status: "starting", StartedAt: store.NowMS()}
+	if err := s.CreateJob(j); err != nil {
+		t.Fatal(err)
+	}
+	if err := Stop([]string{j.ID, "--owner", "b"}); err == nil || !strings.Contains(err.Error(), "pass --force") {
+		t.Fatalf("cross-owner stop: %v", err)
+	}
+}
+
 // --owner defaults to $T3CODE_THREAD_ID (parse only: nothing runs), and --owner= selects the shared namespace.
 func TestOwnerFlag(t *testing.T) {
 	t.Setenv("T3CODE_THREAD_ID", "t-env")

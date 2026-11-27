@@ -122,6 +122,14 @@ func List(s *store.Store, owner string, all bool) ([]store.Job, error) {
 	return js, nil
 }
 
+// NotOwnerError is Stop refusing another owner's job without force. It names no flag or param: the
+// CLI adds "--force", the MCP server "force: true".
+type NotOwnerError struct{ Job, Owner, Caller string }
+
+func (e *NotOwnerError) Error() string {
+	return fmt.Sprintf("job %s belongs to owner %q, not you (owner %q)", e.Job, e.Owner, e.Caller)
+}
+
 // Stop stops a job. A starting job is marked stopped (its worker's claim then fails and it exits).
 // A running job's worker is signalled only while it holds the lock (so the pid is ours):
 // SIGTERM, wait ≤ 3 s, then SIGKILL its process group.
@@ -133,7 +141,7 @@ func Stop(s *store.Store, ref, owner string, force bool) (store.Job, error) {
 		return j, err
 	}
 	if j.Owner != "" && j.Owner != owner && !force {
-		return j, fmt.Errorf("job %s belongs to owner %q, not you (owner %q); pass force (CLI: --force) to stop it anyway", j.ID, j.Owner, owner)
+		return j, &NotOwnerError{Job: j.ID, Owner: j.Owner, Caller: owner}
 	}
 	if j.Status == "starting" {
 		ok, err := s.Abort(j.ID)

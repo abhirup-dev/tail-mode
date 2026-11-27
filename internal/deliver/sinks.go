@@ -55,7 +55,7 @@ func (s t3Sink) Deliver(ctx context.Context, d Digest) error {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, t3Bin(), "thread", "send", s.thread, "-")
-	cmd.Stdin = strings.NewReader(Text(d))
+	cmd.Stdin = strings.NewReader(PushText(d)) // the thread's agent has the MCP tools: no CLI hint
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {

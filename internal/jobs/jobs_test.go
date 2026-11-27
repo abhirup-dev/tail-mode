@@ -463,7 +463,9 @@ func TestOwnersSameName(t *testing.T) {
 	}
 
 	// Across owners by id: refused without force, and the error names the owner.
-	if _, err := Stop(s, ids[0], "thread-b", false); err == nil || !strings.Contains(err.Error(), `"thread-a"`) {
+	var noe *NotOwnerError
+	if _, err := Stop(s, ids[0], "thread-b", false); !errors.As(err, &noe) || !strings.Contains(err.Error(), `"thread-a"`) ||
+		strings.Contains(err.Error(), "force") {
 		t.Fatalf("cross-owner stop: %v", err)
 	}
 	if st := status(t, s, ids[0]).Status; st != "running" {

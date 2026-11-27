@@ -152,10 +152,11 @@ export default function tailMode(pi: ExtensionAPI): void {
     label: "Tail start",
     description: "Run a long-running command (dev server, build, test watcher, remote script) or tail a file in the " +
       "background; prefer this over your own background shell. One of file, cmd (with optional dir, env, shell, login), " +
-      "or source+config; optionally on host (ssh) or transport+target. Returns the job; read output with tail_read. " +
+      "or source+config; optionally on host (an ssh host; omit for local). dir and file paths are resolved on the target host " +
+      "for host jobs. Returns the job; read output with tail_read. " +
       "Set notify_every (e.g. '30s') and/or notify_match to get woken with digests, starting from the job's first line. " +
       "env is exported in the job's shell on the target host (the remote host for host jobs). " +
-      "To block until ready, use tail_wait.",
+      "With notifications on, end your turn: each digest starts a new one. For a short wait until ready, use tail_wait.",
     parameters: Type.Object({
       file: Type.Optional(Type.String({ description: "File to tail -F (shorthand for source=file)" })),
       cmd: Type.Optional(Type.String({ description: "Long-running shell command to run and capture (shorthand for source=cmd)" })),
@@ -169,9 +170,7 @@ export default function tailMode(pi: ExtensionAPI): void {
       config: Type.Optional(Type.Record(Type.String(), Type.Unknown(), {
         description: "Adapter config, e.g. file: {path, backlog}; cmd: {cmd}",
       })),
-      host: Type.Optional(Type.String({ description: "ssh host (shorthand for transport=ssh target=host); omit for local" })),
-      transport: Type.Optional(Type.String({ description: "local (default) or ssh" })),
-      target: Type.Optional(Type.String({ description: "Transport target, e.g. the ssh host" })),
+      host: Type.Optional(Type.String({ description: "ssh host to run on; omit for local" })),
       name: Type.Optional(Type.String()),
       backlog: Type.Optional(Type.Number({ description: "file only: initial lines (default 50, 0 = none)" })),
       restart: Type.Optional(Type.Boolean({ description: "Restart when the source ends (default: file yes, cmd no)" })),
@@ -189,7 +188,7 @@ export default function tailMode(pi: ExtensionAPI): void {
       }
       // The CLI fills in local defaults (cwd as the cmd dir, absolute file paths) from its own cwd, which is Pi's.
       const args = ["start", ...flags({
-        name: p.name, host: p.host, transport: p.transport, target: p.target, backlog: p.backlog,
+        name: p.name, host: p.host, backlog: p.backlog,
         dir: p.dir, shell: p.shell, owner: p.owner,
       })];
       for (const [k, v] of env) args.push("--env", `${k}=${v}`);
@@ -214,13 +213,13 @@ export default function tailMode(pi: ExtensionAPI): void {
     name: "tail_wait",
     label: "Tail wait",
     description: "Block until a job prints a line matching until (a regex), e.g. a dev server's \"ready|listening\" line. " +
-      "Required: job, until. Returns the matching lines and a cursor, or says it timed out (default 50s) or that the job ended " +
-      "(tail_jobs then shows its exit code). after defaults to 0 (the job's first line). For long waits prefer tail_notify. " + DATA_NOTE,
+      "For short waits (< ~1 min) only; with notifications on, end your turn instead. Required: job, until. Returns the matching lines and a cursor, or says it timed out (default 50s) or that the job ended " +
+      "(tail_jobs then shows its exit code). after is an exclusive cursor: only lines with id > after count (default 0). For long waits prefer tail_notify. " + DATA_NOTE,
     parameters: Type.Object({
       job: Type.String({ description: "Job id or name" }),
       until: Type.String({ description: "Regex to wait for" }),
       timeout: Type.Optional(Type.String({ description: "How long to block (default 50s)" })),
-      after: Type.Optional(Type.Number({ description: "Only lines after this cursor count (default 0 = from the start)" })),
+      after: Type.Optional(Type.Number({ description: "Exclusive cursor: only lines with id > after count (default 0 = from the start)" })),
       owner: OWNER,
     }),
     async execute(_id, p, signal) {
@@ -268,7 +267,7 @@ export default function tailMode(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "tail_read",
     label: "Tail read",
-    description: `Read a job's lines oldest first. after=line id cursor (pass the returned cursor for new lines), tail=last N, grep=regex. ${DATA_NOTE}`,
+    description: `Read a job's lines oldest first. after=exclusive cursor: returns lines with id > after (pass the returned cursor for new lines), tail=last N, grep=regex. ${DATA_NOTE}`,
     parameters: Type.Object({
       job: Type.String({ description: "Job id or name" }),
       after: Type.Optional(Type.Number()),
@@ -348,7 +347,7 @@ export default function tailMode(pi: ExtensionAPI): void {
       job: Type.String({ description: "Job id or name" }),
       every: Type.Optional(Type.String({ description: "default 30s" })),
       match: Type.Optional(Type.String({ description: "Only notify on matching lines" })),
-      after: Type.Optional(Type.Number({ description: "Start after this cursor (default: from now; 0 = from the start)" })),
+      after: Type.Optional(Type.Number({ description: "Exclusive cursor: digest lines with id > after (default: from now; 0 = from the start)" })),
       owner: OWNER,
     }),
     async execute(_id, p, signal) {

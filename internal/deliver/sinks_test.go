@@ -21,16 +21,44 @@ func TestText(t *testing.T) {
 	if got := Text(sample); got != want {
 		t.Fatalf("got\n%s\nwant\n%s", got, want)
 	}
-	// Final digests carry how the job ended.
+	// Final digests lead with FINISHED, how the job ended, its line count and its last line.
 	code := 3
 	for d, want := range map[*Digest]string{
-		{Job: "j1", Status: "exited", Final: true, ExitCode: &code}:       " · exited 3 · cursor 0\n",
-		{Job: "j1", Status: "failed", Final: true, Error: "ssh: boom\nx"}: " · failed: ssh: boom ⏎ x · cursor 0\n",
-		{Job: "j1", Status: "stopped", Final: true}:                       " · stopped · cursor 0\n",
+		{Job: "j1", Status: "exited", Final: true, ExitCode: &code}:       "FINISHED · exited 3 · 0 lines · last: (no output)\n",
+		{Job: "j1", Status: "failed", Final: true, Error: "ssh: boom\nx"}: "FINISHED · failed: ssh: boom ⏎ x · 0 lines · last: (no output)\n",
+		{Job: "j1", Status: "stopped", Final: true}:                       "FINISHED · stopped · 0 lines · last: (no output)\n",
 	} {
-		if got := Text(*d); !strings.HasPrefix(got, "[tail-mode] j1 on local · 0 new lines"+want) {
+		if got := Text(*d); !strings.HasPrefix(got, "[tail-mode] j1 "+want+"  on local · 0 new lines · cursor 0\n") {
 			t.Errorf("got %q", got)
 		}
+	}
+	// The last line shows even when it did not match the filter, labelled; long lines are clipped.
+	final := Digest{Job: "j2", Name: "hillclimb", Host: "vps", Status: "exited", Final: true, ExitCode: &code, New: 2, Matched: 1,
+		Match: "ERR", From: 10, To: 16, Total: 16, LastLine: &Line{ID: 16, Text: "score 0.93 " + strings.Repeat("x", 300)},
+		Lines: []Line{{ID: 15, TS: sample.Lines[0].TS, Text: "ERR one"}}}
+	got := Text(final)
+	head := strings.SplitN(got, "\n", 2)[0]
+	if !strings.HasPrefix(head, "[tail-mode] hillclimb FINISHED · exited 3 · 16 lines · last (not matching /ERR/): score 0.93 xxx") ||
+		!strings.HasSuffix(head, "…") || len(head) > 260 ||
+		!strings.Contains(got, "\n  on vps · 2 new lines, 1 match /ERR/ · cursor 16\n  12:01:03 ERR one\n") {
+		t.Fatalf("final digest:\n%s", got)
+	}
+	final.LastMatched, final.LastLine = true, &Line{ID: 16, Text: "ERR last"}
+	if got := Text(final); !strings.Contains(got, " · 16 lines · last: ERR last\n") {
+		t.Fatalf("matching last line:\n%s", got)
+	}
+	// Running digests never say FINISHED.
+	if strings.Contains(Text(sample), "FINISHED") {
+		t.Fatal("running digest says FINISHED")
+	}
+}
+
+// Pushed digests (t3) name only the MCP tool, never the CLI.
+func TestPushText(t *testing.T) {
+	got := PushText(sample)
+	if strings.Contains(got, "tail-mode read") || strings.Contains(got, "CLI:") ||
+		!strings.HasSuffix(got, "More: tail_read job=jabc123 after=1234\n") {
+		t.Fatalf("push text:\n%s", got)
 	}
 }
 
@@ -73,8 +101,20 @@ func TestJSONLSinkHasText(t *testing.T) {
 	if err := (writerSink{w: &buf, json: true}).Deliver(context.Background(), final); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(buf.String(), `"exit_code":0`) {
-		t.Fatalf("exit code 0 missing: %s", buf.String())
+	if !strings.Contains(buf.String(), `"exit_code":0`) || !strings.Contains(buf.String(), `"final":true`) {
+		t.Fatalf("exit code 0 / final missing: %s", buf.String())
+	}
+	buf.Reset()
+	final.LastLine, final.Total = &Line{ID: 7, Text: "done"}, 7
+	if err := (writerSink{w: &buf, json: true}).Deliver(context.Background(), final); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buf.String(), `"last_line":{"id":7,"ts":0,"text":"done"}`) || !strings.Contains(buf.String(), `"total_lines":7`) {
+		t.Fatalf("last_line / total_lines missing: %s", buf.String())
+	}
+	buf.Reset()
+	if err := (writerSink{w: &buf, json: true}).Deliver(context.Background(), sample); err != nil || !strings.Contains(buf.String(), `"final":false`) {
+		t.Fatalf("running digest lacks final:false: %v %s", err, buf.String())
 	}
 }
 
@@ -98,7 +138,7 @@ func TestT3Sink(t *testing.T) {
 		t.Fatal(err)
 	}
 	b, _ := os.ReadFile(out)
-	if want := "thread send T9 -\n" + Text(sample); string(b) != want {
+	if want := "thread send T9 -\n" + PushText(sample); string(b) != want || strings.Contains(string(b), "CLI:") {
 		t.Fatalf("got %q", b)
 	}
 	os.WriteFile(bin, []byte("#!/bin/sh\necho boom >&2\nexit 2\n"), 0o755)

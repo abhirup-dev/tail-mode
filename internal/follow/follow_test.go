@@ -121,7 +121,11 @@ func TestFollowMatchAndFinal(t *testing.T) {
 	if !f.Final || f.Status != "exited" || f.ExitCode == nil || *f.ExitCode != 3 || f.New != 1 || f.From != d.To {
 		t.Fatalf("bad final %+v", f)
 	}
-	if got := deliver.Text(f); !strings.Contains(got, " · exited 3 · cursor ") {
+	// The final digest carries the job's last line even though it did not match, and says FINISHED.
+	if f.LastLine == nil || f.LastLine.Text != "no match" || f.LastMatched || f.Total != 6 {
+		t.Fatalf("final summary %+v %+v", f, f.LastLine)
+	}
+	if got := deliver.PushText(f); !strings.HasPrefix(got, "[tail-mode] web FINISHED · exited 3 · 6 lines · last (not matching /ERR/): no match\n") {
 		t.Fatalf("final digest header: %s", got)
 	}
 }

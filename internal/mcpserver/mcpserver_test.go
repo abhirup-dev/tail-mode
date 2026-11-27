@@ -106,7 +106,7 @@ func TestStartOpts(t *testing.T) {
 	if err != nil || o.Transport != "ssh" || o.Target != "vps" || o.Spec.Kind != "file" || string(o.Spec.Config) != `{"path":"/var/log/a","backlog":0}` {
 		t.Fatalf("%v %+v %s", err, o, o.Spec.Config)
 	}
-	o, err = startOpts(StartIn{Source: "cmd", Config: map[string]any{"cmd": "echo hi"}, Transport: "local"})
+	o, err = startOpts(StartIn{Source: "cmd", Config: map[string]any{"cmd": "echo hi"}})
 	if err != nil || o.Spec.Kind != "cmd" || string(o.Spec.Config) != `{"cmd":"echo hi"}` {
 		t.Fatalf("%v %+v", err, o)
 	}
@@ -120,7 +120,6 @@ func TestStartOpts(t *testing.T) {
 		{File: "a", Source: "file"},
 		{Cmd: "b", Config: map[string]any{}},
 		{Cmd: "b", Backlog: &zero},
-		{File: "a", Host: "h", Transport: "ssh"},
 		{Source: "cmd", Config: "{bad"},
 	} {
 		_, err := startOpts(in)
@@ -189,7 +188,8 @@ func TestStartNotifyFromZero(t *testing.T) {
 	cs := client(t, testStore(t))
 	out := call(t, cs, "tail_start", map[string]any{"file": "/x", "backlog": 5, "notify_every": "10s", "notify_match": "ERR"})
 	if !strings.Contains(out, "started:\n  job: j000009\n") || !strings.Contains(out, "notifications: on → this T3 thread thread-1") ||
-		!strings.Contains(out, "from the job's first line") || !strings.Contains(out, "help[2]:\n  tail_wait job=j000009 until=<regex>") {
+		!strings.Contains(out, "from the job's first line") || !strings.Contains(out, "help[2]:\n  Notifications on. End your turn now") ||
+		strings.Contains(out, "tail_wait") {
 		t.Fatal(out)
 	}
 	var cfg source.FileConfig
@@ -404,5 +404,80 @@ func TestDescriptions(t *testing.T) {
 	}
 	if !strings.Contains(wait, "Required: job, until") || !strings.Contains(wait, "prefer tail_notify") {
 		t.Errorf("tail_wait description: %s", wait)
+	}
+}
+
+// tail_start takes host only (no transport/target, on any tool); host alone runs the job over ssh.
+func TestStartHostOnly(t *testing.T) {
+	started, _ := stubs(t)
+	cs := client(t, testStore(t))
+	res, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tool := range res.Tools {
+		var schema struct {
+			Properties map[string]any `json:"properties"`
+		}
+		b, _ := json.Marshal(tool.InputSchema)
+		if err := json.Unmarshal(b, &schema); err != nil {
+			t.Fatal(err)
+		}
+		for _, p := range []string{"transport", "target"} {
+			if _, ok := schema.Properties[p]; ok {
+				t.Errorf("%s has param %s", tool.Name, p)
+			}
+		}
+		if tool.Name == "tail_start" {
+			if _, ok := schema.Properties["host"]; !ok {
+				t.Errorf("tail_start lacks host: %s", b)
+			}
+		}
+	}
+	out := call(t, cs, "tail_start", map[string]any{"cmd": "./build.sh", "host": "vps", "dir": "/srv/app", "owner": "me"})
+	var cfg source.CmdConfig
+	if err := json.Unmarshal(started.Spec.Config, &cfg); err != nil || started.Transport != "ssh" || started.Target != "vps" ||
+		cfg.Dir != "/srv/app" || !strings.Contains(out, "on: ssh vps") {
+		t.Fatalf("%+v %v\n%s", *started, err, out)
+	}
+	if text := callErr(t, cs, "tail_start", map[string]any{"cmd": "x", "host": "vps", "transport": "ssh"}); !strings.Contains(text, "transport") {
+		t.Fatalf("transport accepted: %s", text)
+	}
+}
+
+// With a T3 thread, a notify-on result tells the agent to end its turn and never suggests tail_wait.
+func TestNotifyOnSaysEndTurn(t *testing.T) {
+	stubs(t)
+	t.Setenv("T3CODE_THREAD_ID", "thread-1")
+	cs := client(t, testStore(t))
+	for _, c := range []struct {
+		tool string
+		args map[string]any
+	}{
+		{"tail_start", map[string]any{"cmd": "make", "dir": "/abs", "notify_match": "ERROR"}},
+		{"tail_start", map[string]any{"cmd": "make", "dir": "/abs", "notify_every": "30s"}},
+		{"tail_notify", map[string]any{"job": "j000001"}},
+	} {
+		out := call(t, cs, c.tool, c.args)
+		if !strings.Contains(out, "notifications: on") || !strings.Contains(out, "End your turn") || strings.Contains(out, "tail_wait") {
+			t.Errorf("%s %v:\n%s", c.tool, c.args, out)
+		}
+	}
+	// Notifications off: tail_wait stays a suggestion.
+	if out := call(t, cs, "tail_start", map[string]any{"cmd": "make", "dir": "/abs"}); strings.Contains(out, "End your turn") || !strings.Contains(out, "tail_wait") {
+		t.Errorf("notify off:\n%s", out)
+	}
+}
+
+// MCP errors name the MCP param, not the CLI flag.
+func TestStopForceWording(t *testing.T) {
+	s := testStore(t)
+	if err := s.CreateJob(store.Job{ID: "j0000ab", Owner: "a", Kind: "cmd", Transport: "local", Spec: `{}`, Status: "starting", StartedAt: store.NowMS()}); err != nil {
+		t.Fatal(err)
+	}
+	cs := client(t, s)
+	text := callErr(t, cs, "tail_stop", map[string]any{"job": "j0000ab", "owner": "b"})
+	if !strings.Contains(text, "force: true") || strings.Contains(text, "--force") || strings.Contains(text, "CLI") {
+		t.Fatalf("stop without force: %s", text)
 	}
 }

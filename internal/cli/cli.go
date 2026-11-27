@@ -352,6 +352,9 @@ func (c *stopCmd) Run() error {
 	}
 	defer s.Close()
 	j, err := jobs.Stop(s, c.Job, c.Owner, c.Force)
+	if noe := (*jobs.NotOwnerError)(nil); errors.As(err, &noe) {
+		return fmt.Errorf("%w; pass --force to stop it anyway", err)
+	}
 	if err != nil {
 		return err
 	}

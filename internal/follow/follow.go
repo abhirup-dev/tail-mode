@@ -136,6 +136,7 @@ func Follow(ctx context.Context, s *store.Store, job store.Job, o Options, sink 
 					d.ExitCode = &code
 				}
 				d.Error = job.Error
+				finalSummary(s, job, o.Match, &d)
 				return deliverFinal(ctx, sink, d)
 			}
 			if err := sink.Deliver(ctx, d); err != nil {
@@ -152,6 +153,19 @@ func Follow(ctx context.Context, s *store.Store, job store.Job, o Options, sink 
 			return ctx.Err()
 		case <-t.C:
 		}
+	}
+}
+
+// finalSummary adds the job's total line count and last line (matching or not) to a final digest.
+// Best effort: a store error leaves them unset rather than losing the final digest.
+func finalSummary(s *store.Store, job store.Job, match *regexp.Regexp, d *deliver.Digest) {
+	if err := s.Stats(&job); err == nil {
+		d.Total = job.Lines
+	}
+	if ls, err := s.Read(store.ReadQuery{Job: job.ID, Tail: 1, Limit: 1}); err == nil && len(ls) == 1 {
+		l := toLine(ls[0])
+		d.LastLine = &l
+		d.LastMatched = match == nil || match.MatchString(ls[0].Text)
 	}
 }
 
