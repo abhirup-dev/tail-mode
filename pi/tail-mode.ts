@@ -16,14 +16,16 @@ const EARLY_EXIT_MS = 1000;
 type Line = { id: number; job: string; ts: number; text: string };
 type Job = { id: string; name?: string; started_at?: number };
 
-type Result = { ok: boolean; out: string };
+type Result = { ok: boolean; out: string; code?: number };
 
 function run(args: string[], signal?: AbortSignal): Promise<Result> {
   return new Promise((resolve) => {
     execFile(BIN, [...args, "--json"], { signal, maxBuffer: 64 << 20 }, (err, stdout, stderr) => {
       const out = String(stdout).trim();
-      if (err) resolve({ ok: false, out: `error: ${String(stderr).trim() || err.message}${out ? "\n" + out : ""}` });
-      else resolve({ ok: true, out });
+      const raw = (err as { code?: unknown } | null)?.code;
+      const code = typeof raw === "number" ? raw : undefined;
+      if (err) resolve({ ok: false, code, out: `error: ${String(stderr).trim() || err.message}${out ? "\n" + out : ""}` });
+      else resolve({ ok: true, code: 0, out });
     });
   });
 }
@@ -152,7 +154,8 @@ export default function tailMode(pi: ExtensionAPI): void {
       "background; prefer this over your own background shell. One of file, cmd (with optional dir, env, shell, login), " +
       "or source+config; optionally on host (ssh) or transport+target. Returns the job; read output with tail_read. " +
       "Set notify_every (e.g. '30s') and/or notify_match to get woken with digests, starting from the job's first line. " +
-      "To block until ready, run `tail-mode wait <job> --until RE --after 0` (exit 0 match, 3 timeout, 4 job ended).",
+      "env is exported in the job's shell on the target host (the remote host for host jobs). " +
+      "To block until ready, use tail_wait.",
     parameters: Type.Object({
       file: Type.Optional(Type.String({ description: "File to tail -F (shorthand for source=file)" })),
       cmd: Type.Optional(Type.String({ description: "Long-running shell command to run and capture (shorthand for source=cmd)" })),
@@ -204,6 +207,32 @@ export default function tailMode(pi: ExtensionAPI): void {
         out += "\n" + (id ? await follow(id, p.notify_every || "30s", p.notify_match, 0) : "notify skipped: could not parse job id");
       }
       return text(out);
+    },
+  });
+
+  pi.registerTool({
+    name: "tail_wait",
+    label: "Tail wait",
+    description: "Block until a job prints a line matching until (a regex), e.g. a dev server's \"ready|listening\" line. " +
+      "Required: job, until. Returns the matching lines and a cursor, or says it timed out (default 50s) or that the job ended " +
+      "(tail_jobs then shows its exit code). after defaults to 0 (the job's first line). For long waits prefer tail_notify. " + DATA_NOTE,
+    parameters: Type.Object({
+      job: Type.String({ description: "Job id or name" }),
+      until: Type.String({ description: "Regex to wait for" }),
+      timeout: Type.Optional(Type.String({ description: "How long to block (default 50s)" })),
+      after: Type.Optional(Type.Number({ description: "Only lines after this cursor count (default 0 = from the start)" })),
+      owner: OWNER,
+    }),
+    async execute(_id, p, signal) {
+      const timeout = p.timeout || "50s";
+      const r = await run(["wait", p.job, ...flags({ until: p.until, timeout, after: p.after ?? 0, owner: p.owner })], signal);
+      if (r.code === 3) return text(`wait: timed out after ${timeout}; no line matched /${p.until}/ (call again, or use tail_notify)`);
+      if (r.code === 4) return text(`wait: job ended without a line matching /${p.until}/; tail_jobs shows its exit code, tail_read its last lines`);
+      const ls = parse<Line[]>(r);
+      if (typeof ls === "string") return text(ls);
+      const rows = ls.map((l) => `${l.id} ${hhmmss(l.ts)} ${l.text}`);
+      return text(render(`${DATA_NOTE} [tail-mode] wait: matched /${p.until}/ in ${p.job}`, rows, (shown) =>
+        shown ? `cursor ${ls[shown - 1].id} (pass as after for newer lines)\n` : ""));
     },
   });
 

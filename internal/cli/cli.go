@@ -212,7 +212,7 @@ func (c *startCmd) Run() error {
 	if c.JSON {
 		return printJSON(j)
 	}
-	fmt.Fprintf(stdout, "%s started (pid %d): %s\n", label(j), j.PID, j.Describe)
+	fmt.Fprintf(stdout, "%s started (pid %d): %s\n", label(j), j.PID, store.OneLine(j.Describe))
 	return nil
 }
 
@@ -297,7 +297,7 @@ func (c *runCmd) Run() error {
 		b, _ := json.Marshal(j)
 		fmt.Fprintln(stdout, string(b))
 	} else {
-		fmt.Fprintf(stdout, "%s started (pid %d): %s\n", label(j), j.PID, j.Describe)
+		fmt.Fprintf(stdout, "%s started (pid %d): %s\n", label(j), j.PID, store.OneLine(j.Describe))
 	}
 
 	if wantNotify {
@@ -358,7 +358,7 @@ func (c *stopCmd) Run() error {
 	if c.JSON {
 		return printJSON(j)
 	}
-	fmt.Fprintf(stdout, "%s %s\n", label(j), j.Status)
+	fmt.Fprintf(stdout, "%s %s\n", label(j), store.StatusText(j.Status, j.ExitCode, j.Error))
 	return nil
 }
 
@@ -395,11 +395,8 @@ func (c *jobsCmd) Run() error {
 		if j.LastTS > 0 {
 			last = time.Since(time.UnixMilli(j.LastTS)).Round(time.Second).String() + " ago"
 		}
-		status := j.Status
-		if j.Status == "exited" || j.Status == "failed" {
-			status = fmt.Sprintf("%s(%d)", j.Status, j.ExitCode)
-		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\t%s", j.ID, j.Name, status, j.Lines, last, j.Describe)
+		status := deliver.Clip(store.StatusText(j.Status, j.ExitCode, j.Error), 60)
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\t%s", j.ID, store.OneLine(j.Name), status, j.Lines, last, store.OneLine(j.Describe))
 		if c.All {
 			fmt.Fprintf(tw, "\t%s", j.Owner)
 		}

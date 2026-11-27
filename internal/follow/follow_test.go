@@ -112,14 +112,17 @@ func TestFollowMatchAndFinal(t *testing.T) {
 	if n := len(sink.get()); n != 1 {
 		t.Fatalf("want 1 digest, got %d", n)
 	}
-	s.Finish(j.ID, "exited", 0, "", false)
+	s.Finish(j.ID, "exited", 3, "", false)
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
 	ds := sink.get()
 	f := ds[len(ds)-1]
-	if !f.Final || f.Status != "exited" || f.New != 1 || f.From != d.To {
+	if !f.Final || f.Status != "exited" || f.ExitCode == nil || *f.ExitCode != 3 || f.New != 1 || f.From != d.To {
 		t.Fatalf("bad final %+v", f)
+	}
+	if got := deliver.Text(f); !strings.Contains(got, " · exited 3 · cursor ") {
+		t.Fatalf("final digest header: %s", got)
 	}
 }
 
@@ -210,5 +213,19 @@ func TestFollowLostEnds(t *testing.T) {
 	}
 	if ds := sink.get(); len(ds) != 1 || !ds[0].Final || ds[0].Status != "lost" {
 		t.Fatalf("got %+v", ds)
+	}
+}
+
+// WaitCursor returns where to wait again from: the last match, or the last line checked.
+func TestWaitCursor(t *testing.T) {
+	s, j := setup(t, true)
+	s.Append(j.ID, []string{"a", "ready 1", "b", "ready 2", "c"}, store.NowMS())
+	lines, code, cur, err := WaitCursor(context.Background(), s, j, regexp.MustCompile("ready"), time.Second, 0)
+	if err != nil || code != 0 || len(lines) != 2 || cur != lines[1].ID {
+		t.Fatalf("match: %v %d %d %v", lines, code, cur, err)
+	}
+	_, code, cur, err = WaitCursor(context.Background(), s, j, regexp.MustCompile("never"), 60*time.Millisecond, 0)
+	if max, _ := s.MaxID(j.ID); err != nil || code != 3 || cur != max {
+		t.Fatalf("timeout: %d %d (max %d) %v", code, cur, max, err)
 	}
 }

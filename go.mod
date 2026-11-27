@@ -10,6 +10,7 @@ require (
 	github.com/gofrs/flock v0.13.2
 	github.com/modelcontextprotocol/go-sdk v1.8.0
 	github.com/ncruces/go-sqlite3 v0.38.1
+	github.com/toon-format/toon-go v1.0.1
 )
 
 require (

@@ -172,3 +172,35 @@ func TestOwnerFlag(t *testing.T) {
 		t.Fatalf("search %+v", r.Search)
 	}
 }
+
+// The jobs table shows exit codes and keeps a multi-line command on one row.
+func TestJobsTable(t *testing.T) {
+	t.Setenv("TAIL_MODE_HOME", t.TempDir())
+	s, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	for i, j := range []store.Job{
+		{ID: "j000001", Name: "a", Describe: "make test", StartedAt: 1},
+		{ID: "j000002", Name: "b", Describe: "echo one\necho two", StartedAt: 2},
+	} {
+		j.Kind, j.Transport, j.Spec, j.Status = "cmd", "local", "{}", "starting"
+		if err := s.CreateJob(j); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Finish(j.ID, []string{"exited", "failed"}[i], 3, "boom", true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var buf bytes.Buffer
+	stdout = &buf
+	t.Cleanup(func() { stdout = os.Stdout })
+	if err := Jobs([]string{"--owner="}); err != nil {
+		t.Fatal(err)
+	}
+	got := buf.String()
+	if strings.Count(got, "\n") != 3 || !strings.Contains(got, "exited 3") || !strings.Contains(got, "failed: boom") || !strings.Contains(got, "echo one ⏎ echo two") {
+		t.Fatalf("jobs:\n%s", got)
+	}
+}

@@ -1,6 +1,6 @@
 # tail-mode for Pi
 
-Pi extension exposing `tail_start`, `tail_stop`, `tail_jobs`, `tail_read`, `tail_search`, `tail_sql`, `tail_notify`.
+Pi extension exposing `tail_start`, `tail_wait`, `tail_stop`, `tail_jobs`, `tail_read`, `tail_search`, `tail_sql`, `tail_notify`.
 Each tool shells out to `tail-mode … --json`. Notifiers (`tail_notify`, or `tail_start` with `notify_every`) run
 `tail-mode follow <job> --deliver jsonl` as a child of Pi and wake the session with a digest message
 (`customType: "tail-mode-digest"`). They stop when the job ends or the Pi session shuts down; the jobs themselves keep running.

@@ -249,11 +249,7 @@ func (s *Store) ListJobs(owner string, all bool) ([]Job, error) {
 	}
 	rows.Close()
 	for i := range out {
-		// shortcut: COUNT(*) scans the job's index range; fine to ~10M lines, upgrade with a counter column.
-		_ = s.db.QueryRow(`SELECT COUNT(*), COALESCE(MAX(id),0) FROM lines WHERE job=?`, out[i].ID).Scan(&out[i].Lines, &out[i].LastID)
-		if out[i].LastID > 0 {
-			_ = s.db.QueryRow(`SELECT ts FROM lines WHERE id=?`, out[i].LastID).Scan(&out[i].LastTS)
-		}
+		_ = s.Stats(&out[i])
 	}
 	return out, rows.Err()
 }

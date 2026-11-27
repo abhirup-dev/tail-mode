@@ -15,7 +15,10 @@ type Digest struct {
 	From    int64  `json:"from"`              // cursor before (exclusive)
 	To      int64  `json:"to"`                // cursor after (inclusive)
 	Final   bool   `json:"final,omitempty"`   // job stopped running; last digest
-	Lines   []Line `json:"lines"`
+	// Set on the final digest: how the job ended. ExitCode is set when Status is "exited".
+	ExitCode *int   `json:"exit_code,omitempty"`
+	Error    string `json:"error,omitempty"` // failed jobs: why
+	Lines    []Line `json:"lines"`
 }
 
 type Line struct {

@@ -131,6 +131,11 @@ func Follow(ctx context.Context, s *store.Store, job store.Job, o Options, sink 
 				d.Match = o.Match.String()
 			}
 			if !running {
+				if job.Status == "exited" {
+					code := job.ExitCode
+					d.ExitCode = &code
+				}
+				d.Error = job.Error
 				return deliverFinal(ctx, sink, d)
 			}
 			if err := sink.Deliver(ctx, d); err != nil {
@@ -173,9 +178,16 @@ func toLine(l store.Line) deliver.Line {
 // Wait polls every second until a line after `after` matches until (exit 0, ≤20 lines), the timeout
 // passes (3), or the job ends without a match (4). timeout 0 = none.
 func Wait(ctx context.Context, s *store.Store, job store.Job, until *regexp.Regexp, timeout time.Duration, after int64) ([]store.Line, int, error) {
+	lines, code, _, err := WaitCursor(ctx, s, job, until, timeout, after)
+	return lines, code, err
+}
+
+// WaitCursor is Wait that also returns the cursor reached: the last matching line on a match, else
+// the last line checked, so waiting again from it misses nothing.
+func WaitCursor(ctx context.Context, s *store.Store, job store.Job, until *regexp.Regexp, timeout time.Duration, after int64) ([]store.Line, int, int64, error) {
 	cursor, err := startCursor(s, job.ID, after)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, cursor, err
 	}
 	if timeout > 0 {
 		var cancel context.CancelFunc
@@ -187,29 +199,31 @@ func Wait(ctx context.Context, s *store.Store, job store.Job, until *regexp.Rege
 	for {
 		running, err := liveStatus(s, &job)
 		if err != nil {
-			return nil, 0, err
+			return nil, 0, cursor, err
 		}
 		max, err := s.MaxID(job.ID)
 		if err != nil {
-			return nil, 0, err
+			return nil, 0, cursor, err
 		}
 		lines, err := s.Read(store.ReadQuery{Job: job.ID, After: cursor, Grep: until, Limit: 20})
 		if err != nil {
-			return nil, 0, err
+			return nil, 0, cursor, err
 		}
 		if len(lines) > 0 {
-			return lines, 0, nil
+			return lines, 0, lines[len(lines)-1].ID, nil
 		}
-		cursor = max
+		if max > cursor {
+			cursor = max
+		}
 		if !running {
-			return nil, 4, nil
+			return nil, 4, cursor, nil
 		}
 		select {
 		case <-ctx.Done():
 			if ctx.Err() == context.DeadlineExceeded {
-				return nil, 3, nil
+				return nil, 3, cursor, nil
 			}
-			return nil, 0, ctx.Err()
+			return nil, 0, cursor, ctx.Err()
 		case <-t.C:
 		}
 	}

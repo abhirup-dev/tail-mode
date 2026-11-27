@@ -61,7 +61,7 @@ func Start(s *store.Store, o StartOpts) (store.Job, error) {
 	if err != nil {
 		return store.Job{}, err
 	}
-	desc := src.Describe()
+	desc := store.OneLine(src.Describe()) // one line: a multi-line cmd would break tables and headers
 	if t.Target() != "" {
 		desc = t.Target() + ": " + desc
 	}
