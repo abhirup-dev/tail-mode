@@ -10,14 +10,14 @@ digest, when replaced for the same job, or at session shutdown; the jobs keep ru
 
 ## Install
 
-Requires a `tail-mode` build that has `tail-mode tool` (this repo, after the tools unification) on `PATH`,
-or `TAIL_MODE_BIN=/path/to/tail-mode`; with an older binary the extension fails to load.
+Needs a `tail-mode` binary with `tail-mode tool` on `PATH` (or `TAIL_MODE_BIN`):
+`go install github.com/abhirup-dev/tail-mode@latest` (or mise `go:github.com/abhirup-dev/tail-mode`). Then:
 
 ```sh
-ln -s "$PWD/pi/tail-mode.ts" ~/.pi/agent/extensions/tail-mode.ts   # or cp
+pi install git:github.com/abhirup-dev/tail-mode
 ```
 
-Try without installing: `go build -o /tmp/tail-mode . && TAIL_MODE_BIN=/tmp/tail-mode pi -e ./pi/tail-mode.ts`.
+Try a checkout without installing: `pi -e ./pi/tail-mode.ts`.
 
 ## Develop
 
