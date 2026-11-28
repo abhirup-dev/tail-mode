@@ -153,7 +153,7 @@ func TestRunUntil(t *testing.T) {
 	}
 
 	_, _, _ = fakeRun(t, []string{"booting", "crashed"}, true)
-	var ee store.ExitError
+	var ee ExitError
 	if err := Run([]string{"run", "--until", "listening", "--", "npm start"}); !errors.As(err, &ee) || ee.Code != 4 {
 		t.Fatalf("ended job: want exit 4, got %v", err)
 	}

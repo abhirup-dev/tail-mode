@@ -152,7 +152,7 @@ func TestIdentityFromEnv(t *testing.T) {
 		t.Fatalf("thread param accepted: %s", text)
 	}
 	out := call(t, cs, "tail_start", map[string]any{"cmd": "make", "dir": "/abs", "owner": "ignored"})
-	if started.Owner != "thread-1" || !strings.Contains(out, "owner: thread-1") ||
+	if started.Owner != "thread-1" || !strings.Contains(out, "owner: this T3 thread\n") ||
 		!strings.Contains(out, "notifications: off; tail_notify sends digests → this T3 thread thread-1 (detected from your session; you do not need to pass it)") {
 		t.Fatalf("owner %q:\n%s", started.Owner, out)
 	}

@@ -93,7 +93,7 @@ func TestStartOpts(t *testing.T) {
 func TestNotifyDeliverResolution(t *testing.T) {
 	t.Setenv("TAIL_MODE_HOME", t.TempDir())
 	t.Setenv("T3CODE_THREAD_ID", "")
-	if err := Notify([]string{"web"}); err == nil || !strings.Contains(err.Error(), "nowhere to deliver") {
+	if err := Run([]string{"notify", "web"}); err == nil || !strings.Contains(err.Error(), "nowhere to deliver") {
 		t.Fatalf("want resolution error before touching the job, got %v", err)
 	}
 	spec := func(args ...string) string {
@@ -138,20 +138,20 @@ func TestReadAndSQL(t *testing.T) {
 	var buf bytes.Buffer
 	stdout = &buf
 	t.Cleanup(func() { stdout = os.Stdout })
-	if err := Read([]string{"web", "--tail", "2"}); err != nil {
+	if err := Run([]string{"read", "web", "--tail", "2"}); err != nil {
 		t.Fatal(err)
 	}
 	if got := buf.String(); strings.Count(got, "\n") != 2 || !strings.HasSuffix(got, " c\n") {
 		t.Fatalf("read %q", got)
 	}
 	buf.Reset()
-	if err := SQL([]string{"select count(*) n from lines", "--json"}); err != nil {
+	if err := Run([]string{"sql", "select count(*) n from lines", "--json"}); err != nil {
 		t.Fatal(err)
 	}
 	if got := buf.String(); got != `{"columns":["n"],"rows":[[3]]}`+"\n" {
 		t.Fatalf("sql %q", got)
 	}
-	if err := SQL([]string{"delete from lines"}); err == nil {
+	if err := Run([]string{"sql", "delete from lines"}); err == nil {
 		t.Fatal("sql must be read-only")
 	}
 }
@@ -168,7 +168,7 @@ func TestStopForceWording(t *testing.T) {
 	if err := s.CreateJob(j); err != nil {
 		t.Fatal(err)
 	}
-	if err := Stop([]string{j.ID, "--owner", "b"}); err == nil || !strings.Contains(err.Error(), "pass --force") {
+	if err := Run([]string{"stop", j.ID, "--owner", "b"}); err == nil || !strings.Contains(err.Error(), "pass --force") {
 		t.Fatalf("cross-owner stop: %v", err)
 	}
 }
@@ -213,7 +213,7 @@ func TestJobsTable(t *testing.T) {
 	var buf bytes.Buffer
 	stdout = &buf
 	t.Cleanup(func() { stdout = os.Stdout })
-	if err := Jobs([]string{"--owner="}); err != nil {
+	if err := Run([]string{"jobs", "--owner="}); err != nil {
 		t.Fatal(err)
 	}
 	got := buf.String()

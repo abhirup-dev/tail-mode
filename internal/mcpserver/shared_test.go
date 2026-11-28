@@ -129,7 +129,7 @@ func TestSharedModeValidation(t *testing.T) {
 	call(t, cs, "tail_start", map[string]any{"cmd": "make", "dir": "~/app"})
 	call(t, cs, "tail_start", map[string]any{"file": "~/x.log"})
 	out := call(t, cs, "tail_start", map[string]any{"cmd": "make", "dir": "/abs", "notify_match": "ERR"})
-	if !strings.Contains(out, "owner: env-thread\n") || !strings.Contains(out, "dir: /abs\n") || !strings.Contains(out, "notifications: on → this T3 thread env-thread") {
+	if !strings.Contains(out, "owner: this T3 thread\n") || !strings.Contains(out, "dir: /abs\n") || !strings.Contains(out, "notifications: on → this T3 thread env-thread") {
 		t.Fatalf("start:\n%s", out)
 	}
 	if ns := notes(); len(ns) != 1 || ns[0].Deliver != "t3:env-thread" || ns[0].After != 0 {

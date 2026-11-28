@@ -52,8 +52,8 @@ var (
 	waitJob       = follow.WaitCursor
 )
 
-// Shared reports whether the environment asks for shared mode (TAIL_MODE_SHARED=1, true, yes or on).
-func Shared() bool {
+// sharedMode reports whether the environment asks for shared mode (TAIL_MODE_SHARED=1, true, yes or on).
+func sharedMode() bool {
 	switch strings.ToLower(os.Getenv("TAIL_MODE_SHARED")) {
 	case "1", "true", "yes", "on":
 		return true
@@ -67,7 +67,7 @@ func Serve(ctx context.Context) error {
 		return err
 	}
 	defer s.Close()
-	return newServer(s, Shared()).Run(ctx, &mcp.StdioTransport{})
+	return newServer(s, sharedMode()).Run(ctx, &mcp.StdioTransport{})
 }
 
 // server holds what every tool needs. shared: the server's cwd is not the caller's. thread: the
@@ -79,7 +79,7 @@ type server struct {
 }
 
 func newServer(s *store.Store, shared bool) *mcp.Server {
-	h := &server{s: s, shared: shared, thread: strings.TrimSpace(os.Getenv("T3CODE_THREAD_ID"))}
+	h := &server{s: s, shared: shared, thread: deliver.EnvThread()}
 	srv := mcp.NewServer(&mcp.Implementation{Name: "tail-mode", Version: "0.2.0"}, &mcp.ServerOptions{Instructions: instruction})
 	dirRule := "Local cmd: dir defaults to the server's current dir; pass an absolute dir (or ~/x) to be sure. Local file: an absolute path (or ~/x)."
 	if shared {
@@ -90,7 +90,7 @@ func newServer(s *store.Store, shared bool) *mcp.Server {
 		"or source+config (sources: "+strings.Join(source.Kinds(), ", ")+"). host = an ssh host to run on; omit for local. "+
 		"dir and file paths are resolved on the target host for host jobs (local paths for local jobs; absolute required in shared mode). "+
 		dirRule+" env is exported in the job's shell on the target host (the remote host for host jobs). "+
-		"notify_every/notify_match wake you with digests; in T3 they arrive in your own thread automatically (never pass a thread id). "+
+		"notify_every (default 30s, min 5s)/notify_match wake you with digests; in T3 they arrive in your own thread automatically (never pass a thread id). "+
 		`Example: {"name":"build","host":"vps","dir":"/srv/app","cmd":"./build.sh","env":{"MODE":"prod"},"notify_match":"ERROR|FAIL"}. `+
 		"Next: with notifications on, end your turn (digests wake you); otherwise tail_wait for a short wait until ready, "+
 		"tail_read for output, tail_stop when done.",
@@ -118,7 +118,8 @@ func newServer(s *store.Store, shared bool) *mcp.Server {
 	add(srv, "tail_notify", "Get woken with periodic digests of a job's new lines, and a final digest with the exit code when it ends, "+
 		"instead of polling. Required: job. In T3 digests arrive in your own thread automatically (detected from your session; never "+
 		"pass a thread id), each starting a new turn, so end your turn after calling it; elsewhere it returns how to get woken "+
-		"instead. One notifier per job: calling again replaces it. every (default 30s), match (regex: only digest matching lines), "+
+		"instead. One notifier per job and destination: calling it replaces any earlier one for this job, including the one "+
+		"tail_start set up with notify_every/notify_match. every (default 30s, min 5s), match (regex: only digest matching lines), "+
 		"after (exclusive cursor: lines with id > after; default now; 0 = from the job's first line). "+dataNote,
 		h.notifyTool)
 	add(srv, "tail_sql", "Read-only SQL when read/search are not enough: one SELECT, 5 s limit. Tables: jobs(id,name,owner,status,"+
@@ -141,7 +142,7 @@ func add[In any](srv *mcp.Server, name, desc string, fn func(context.Context, In
 			return nil, nil, te
 		}
 		// Safety net only: read/search/sql/wait already fit the budget via render.
-		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: deliver.Clip(text, maxOut)}}}, nil, nil
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: store.Clip(text, maxOut)}}}, nil, nil
 	})
 }
 
@@ -217,7 +218,7 @@ func render(head string, t table, footer func(shown int) string) string {
 		room := room0 - body.Len() - 1
 		if len(r) > room {
 			if shown == 0 && room > 0 { // a single oversized row: show what fits rather than nothing
-				body.WriteString(deliver.Clip(r, room))
+				body.WriteString(store.Clip(r, room))
 				body.WriteByte('\n')
 				shown++
 			}
@@ -236,19 +237,6 @@ func render(head string, t table, footer func(shown int) string) string {
 	return b.String()
 }
 
-type lineRow struct {
-	ID   int64  `toon:"id"`
-	Time string `toon:"time"`
-	Text string `toon:"text"`
-}
-
-type jobLineRow struct {
-	ID   int64  `toon:"id"`
-	Job  string `toon:"job"`
-	Time string `toon:"time"`
-	Text string `toon:"text"`
-}
-
 func plural(n int, one, many string) string {
 	if n == 1 {
 		return "1 " + one
@@ -256,22 +244,17 @@ func plural(n int, one, many string) string {
 	return fmt.Sprintf("%d %s", n, many)
 }
 
-func hhmmss(ms int64) string { return time.UnixMilli(ms).Format("15:04:05") }
-
-func lineTable(key string, ls []store.Line) table {
-	rows := make([]lineRow, len(ls))
+// lineTable is lines as {id,time,text} rows, or {id,job,time,text} with withJob.
+func lineTable(key string, ls []store.Line, withJob bool) table {
+	rows := make([]toon.Object, len(ls))
 	for i, l := range ls {
-		rows[i] = lineRow{l.ID, hhmmss(l.TS), l.Text}
+		fs := []toon.Field{f("id", l.ID)}
+		if withJob {
+			fs = append(fs, f("job", l.Job))
+		}
+		rows[i] = toon.NewObject(append(fs, f("time", store.Clock(l.TS)), f("text", l.Text))...)
 	}
 	return newTable(key, rows, len(rows))
-}
-
-// ago renders how long ago a unix-ms time was ("never" for 0).
-func ago(ms int64) string {
-	if ms == 0 {
-		return "never"
-	}
-	return time.Since(time.UnixMilli(ms)).Round(time.Second).String() + " ago"
 }
 
 // ---- identity
@@ -336,84 +319,64 @@ type StartIn struct {
 	Name        string            `json:"name,omitempty" jsonschema:"job name to refer to it by; names are scoped to your own jobs"`
 	Backlog     *int              `json:"backlog,omitempty" jsonschema:"file only: lines of history on start (default 50, 0 = none)"`
 	Restart     *bool             `json:"restart,omitempty" jsonschema:"restart when the source ends (default: file yes, cmd no)"`
-	NotifyEvery string            `json:"notify_every,omitempty" jsonschema:"e.g. 30s: wake me with digests this often (default 30s if notify_match is set)"`
+	NotifyEvery string            `json:"notify_every,omitempty" jsonschema:"e.g. 30s: wake me with digests this often (default 30s if notify_match is set; min 5s)"`
 	NotifyMatch string            `json:"notify_match,omitempty" jsonschema:"regex: only digest matching lines"`
 }
 
 const startUsage = `give exactly one of cmd="<command>" (+ dir="<absolute dir>"), file="<absolute path>", or source="<kind>" + config={...}`
 
-// startOpts maps the tool params onto jobs.StartOpts; adapters validate their own config in jobs.Start.
+// startOpts maps the tool params onto jobs.StartOpts (local defaults not yet applied); adapters
+// validate their own config in jobs.Start.
 func startOpts(in StartIn) (jobs.StartOpts, error) {
 	o := jobs.StartOpts{Name: in.Name}
 	if in.Host != "" {
 		o.Transport, o.Target = "ssh", in.Host
 	}
-	n := 0
-	for _, set := range []bool{in.File != "", in.Cmd != "", in.Source != ""} {
-		if set {
-			n++
-		}
-	}
-	if n != 1 {
-		return o, fail(startUsage, "tail_start needs exactly one of cmd, file, or source (got %d)", n)
-	}
-	if in.Config != nil && in.Source == "" {
-		return o, fail(startUsage, "config needs source")
-	}
-	if in.Backlog != nil && in.File == "" {
-		return o, fail("with source, put backlog in config", "backlog applies to file")
-	}
-	if (in.Dir != "" || len(in.Env) > 0 || in.Shell != "" || in.Login) && in.Cmd == "" {
-		return o, fail("with source, put them in config", "dir, env, shell and login apply to cmd")
-	}
-	var cfg any
-	switch {
-	case in.File != "":
-		o.Spec.Kind, cfg = "file", source.FileConfig{Path: in.File, Backlog: in.Backlog}
-	case in.Cmd != "":
-		o.Spec.Kind, cfg = "cmd", source.CmdConfig{Cmd: in.Cmd, Dir: in.Dir, Env: in.Env, Shell: in.Shell, Login: in.Login}
-	default:
-		o.Spec.Kind, cfg = in.Source, in.Config
-	}
-	raw, err := rawConfig(cfg)
+	raw, err := rawConfig(in.Config)
 	if err != nil {
 		return o, err
 	}
-	o.Spec.Config, o.Spec.Restart = raw, in.Restart
-	return o, nil
+	o.Spec, err = source.SpecInput{CmdConfig: source.CmdConfig{Cmd: in.Cmd, Dir: in.Dir, Env: in.Env, Shell: in.Shell, Login: in.Login},
+		File: in.File, Backlog: in.Backlog, Source: in.Source, Config: raw, Restart: in.Restart}.Spec()
+	switch {
+	case errors.Is(err, source.ErrOneSource):
+		return o, fail(startUsage, "tail_start %v", err)
+	case errors.Is(err, source.ErrConfigNeedsSource):
+		return o, fail(startUsage, "config needs source")
+	case errors.Is(err, source.ErrBacklogNeedsFile):
+		return o, fail("with source, put backlog in config", "backlog applies to file")
+	case errors.Is(err, source.ErrCmdOptionsNeedCmd):
+		return o, fail("with source, put them in config", "dir, env, shell and login apply to cmd")
+	case errors.Is(err, source.ErrConfigInvalidJSON):
+		return o, fail(`pass config as an object, e.g. config={"cmd": "make"}`, "config is not valid JSON")
+	}
+	return o, err
 }
 
-// rawConfig accepts a config object, or a JSON string some clients send instead.
+// rawConfig accepts a config object, or a JSON string some clients send instead (checked by Spec).
 func rawConfig(v any) (json.RawMessage, error) {
 	switch c := v.(type) {
 	case nil:
 		return nil, nil
 	case string:
-		if !json.Valid([]byte(c)) {
-			return nil, fail(`pass config as an object, e.g. config={"cmd": "make"}`, "config is not valid JSON")
-		}
 		return json.RawMessage(c), nil
 	default:
 		return json.Marshal(c)
 	}
 }
 
-// localDefaults applies the adapters' local defaults to a local job. Unshared, relative paths resolve
-// against the server's cwd (it runs in the agent's dir). Shared, the server's cwd is not the caller's,
-// so they are errors that say exactly what to pass. It checks the final spec, so the generic
-// source+config form is held to the same rule.
+// localDefaults applies the adapters' local defaults to a local job (jobs.StartOpts.Resolve). Unshared,
+// relative paths resolve against the server's cwd (it runs in the agent's dir). Shared, the server's
+// cwd is not the caller's, so they are errors that say exactly what to pass. It checks the final spec,
+// so the generic source+config form is held to the same rule.
 func (h *server) localDefaults(o jobs.StartOpts) (jobs.StartOpts, error) {
-	if o.Transport != "" && o.Transport != "local" {
-		return o, nil
-	}
-	cwd := ""
-	if !h.shared {
+	if !h.shared && o.Local() {
 		var err error
-		if cwd, err = os.Getwd(); err != nil {
+		if o.Cwd, err = os.Getwd(); err != nil {
 			return o, err
 		}
 	}
-	spec, err := source.LocalDefaults(o.Spec, cwd)
+	r, err := o.Resolve()
 	if errors.Is(err, source.ErrNeedAbsolute) {
 		why := fmt.Sprintf("%v; this server cannot see your current dir", err)
 		if o.Spec.Kind == "file" {
@@ -421,11 +384,7 @@ func (h *server) localDefaults(o jobs.StartOpts) (jobs.StartOpts, error) {
 		}
 		return o, fail(`pass dir as an absolute path, e.g. dir="/home/me/app" (with source+config, put "dir" in config), or as ~/x (run pwd in your shell to get your dir)`, "%s", why)
 	}
-	if err != nil {
-		return o, err
-	}
-	o.Spec = spec
-	return o, nil
+	return r, err
 }
 
 func (h *server) start(_ context.Context, in StartIn) (string, error) {
@@ -438,9 +397,10 @@ func (h *server) start(_ context.Context, in StartIn) (string, error) {
 		return "", err
 	}
 	wantNotify := in.NotifyEvery != "" || in.NotifyMatch != ""
-	var every time.Duration
+	var n follow.NotifierOpts
 	if wantNotify { // validate before starting, so a bad regex does not leave an unwatched job
-		if every, err = notifyParams(in.NotifyEvery, in.NotifyMatch); err != nil {
+		// After 0: the job is new, so the notifier sees all of its lines, including backlog and fast output.
+		if n, err = notifyOpts("notify_every", in.NotifyEvery, in.NotifyMatch, 0); err != nil {
 			return "", err
 		}
 	}
@@ -452,8 +412,8 @@ func (h *server) start(_ context.Context, in StartIn) (string, error) {
 	if j.Name != "" {
 		fields = append(fields, f("name", j.Name))
 	}
-	fields = append(fields, resolved(o)...)
-	fields = append(fields, f("source", deliver.Clip(store.OneLine(j.Describe), 200)), f("status", store.StatusText(j.Status, j.ExitCode, j.Error)))
+	fields = append(fields, h.resolved(o)...)
+	fields = append(fields, f("source", store.Clip(store.OneLine(j.Describe), 200)), f("status", j.StatusText()))
 	out := kv(f("started", toon.NewObject(fields...)))
 	if o.Owner == "" {
 		out += kv(f("warning", sharedWarning))
@@ -469,28 +429,31 @@ func (h *server) start(_ context.Context, in StartIn) (string, error) {
 		out += kv(f("notifications", "off; "+h.destination()))
 	case h.thread == "":
 		out += kv(f("notifications", h.destination()))
-		help = append(help[:1], deliver.RecipeLines(j.ID, every, in.NotifyMatch, 0)...)
+		help = append(help[:1], deliver.RecipeLines(j.ID, n.Every, n.Match, n.After)...)
 	default:
-		// After 0: the job is new, so the notifier sees all of its lines, including backlog and fast output.
-		if err := h.notify(j.ID, every, in.NotifyMatch, 0); err != nil {
+		if err := h.notify(j.ID, n); err != nil {
 			out += kv(f("notifications", "failed: "+err.Error()+" (the job is running)"))
 			help = append(help[:1], fmt.Sprintf("tail_notify job=%s retries the notifier", j.ID))
 		} else {
-			out += kv(f("notifications", "on "+h.destination()), f("notify", notifyDesc(every, in.NotifyMatch, "the job's first line")))
+			out += kv(f("notifications", "on "+h.destination()), f("notify", notifyDesc(n, "the job's first line")))
 			help = endTurn(j.ID)
 		}
 	}
 	return out + helpBlock(help...), nil
 }
 
-// resolved echoes what a start resolved to, so the agent sees as whom and where its job runs.
-func resolved(o jobs.StartOpts) []toon.Field {
+// resolved echoes what a start resolved to, so the agent sees as whom and where its job runs. In T3 the
+// owner is the caller's own thread, shown as such (weak agents read a raw id as something to act on).
+func (h *server) resolved(o jobs.StartOpts) []toon.Field {
 	owner := o.Owner
-	if owner == "" {
+	switch {
+	case owner == "":
 		owner = "none (shared namespace)"
+	case owner == h.thread:
+		owner = "this T3 thread"
 	}
 	where := "local"
-	if o.Transport != "" && o.Transport != "local" {
+	if !o.Local() {
 		where = o.Transport + " " + o.Target
 	}
 	out := []toon.Field{f("owner", owner), f("on", where)}
@@ -511,12 +474,13 @@ func resolved(o jobs.StartOpts) []toon.Field {
 	return out
 }
 
-func notifyDesc(every time.Duration, match, from string) string {
-	s := "every " + every.String()
-	if match != "" {
-		s += " · only lines matching /" + match + "/"
+// notifyDesc describes a started notifier with its effective settings.
+func notifyDesc(n follow.NotifierOpts, from string) string {
+	s := "every " + n.Every.String()
+	if n.Match != "" {
+		s += " · only lines matching /" + n.Match + "/"
 	}
-	return s + " · from " + from + " · replaces any earlier notifier for this job"
+	return s + " · from " + from + " · replaces any earlier notifier for this job and destination (including one tail_start set up)"
 }
 
 // ---- tail_stop
@@ -527,34 +491,25 @@ type StopIn struct {
 	Force bool   `json:"force,omitempty" jsonschema:"stop it even if it is another owner's job (do not stop other agents' jobs)"`
 }
 
-func label(j store.Job) string {
-	if j.Name != "" {
-		return j.ID + " (" + j.Name + ")"
-	}
-	return j.ID
-}
-
 func (h *server) stop(_ context.Context, in StopIn) (string, error) {
 	owner := h.owner(in.Caller)
 	j, err := h.job(in.Job, owner)
 	if err != nil {
 		return "", err
 	}
-	if st := jobs.Status(h.s, j); st != "running" && st != "starting" {
-		return kv(f("job", label(j)+" already "+store.StatusText(st, j.ExitCode, j.Error)+" (no-op)")), nil
+	if st := jobs.Status(h.s, j); !store.Live(st) { // idempotent: before the owner check, like a no-op
+		j.Status = st
+		return kv(f("job", j.Label()+" already "+j.StatusText()+" (no-op)")), nil
 	}
-	if j.Owner != "" && j.Owner != owner && !in.Force {
+	j, err = jobs.Stop(h.s, j.ID, owner, in.Force)
+	if noe := (*jobs.NotOwnerError)(nil); errors.As(err, &noe) {
 		return "", fail("do not stop other agents' jobs; pass force: true only if you are sure",
-			"job %s belongs to owner '%s', not to %s", j.ID, j.Owner, h.scope(owner))
-	}
-	j, err = jobs.Stop(h.s, j.ID, owner, true)
-	if noe := (*jobs.NotOwnerError)(nil); errors.As(err, &noe) { // unreachable with force; keeps CLI wording out
-		return "", fail("do not stop other agents' jobs; pass force: true only if you are sure", "%v", err)
+			"job %s belongs to owner '%s', not to %s", noe.Job, noe.Owner, h.scope(owner))
 	}
 	if err != nil {
 		return "", err
 	}
-	return kv(f("job", label(j)+" "+store.StatusText(j.Status, j.ExitCode, j.Error))), nil
+	return kv(f("job", j.Label()+" "+j.StatusText())), nil
 }
 
 // ---- tail_notify
@@ -572,23 +527,23 @@ func (h *server) notifyTool(_ context.Context, in NotifyIn) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	every, err := notifyParams(in.Every, in.Match)
-	if err != nil {
-		return "", err
-	}
 	after, from := int64(-1), "now"
 	if in.After != nil {
 		after, from = *in.After, fmt.Sprintf("after cursor %d", *in.After)
 	}
+	n, err := notifyOpts("every", in.Every, in.Match, after)
+	if err != nil {
+		return "", err
+	}
 	if h.thread == "" {
 		return kv(f("notifications", "no T3 thread detected so nothing was started (this host has no push)")) +
 			helpBlock(append([]string{fmt.Sprintf("tail_wait job=%s until=<regex> blocks until a line matches (up to 5m per call)", j.ID)},
-				deliver.RecipeLines(j.ID, every, in.Match, after)...)...), nil
+				deliver.RecipeLines(j.ID, n.Every, n.Match, n.After)...)...), nil
 	}
-	if err := h.notify(j.ID, every, in.Match, after); err != nil {
+	if err := h.notify(j.ID, n); err != nil {
 		return "", err
 	}
-	return kv(f("job", label(j)), f("notifications", "on "+h.destination()), f("notify", notifyDesc(every, in.Match, from))) +
+	return kv(f("job", j.Label()), f("notifications", "on "+h.destination()), f("notify", notifyDesc(n, from))) +
 		helpBlock(endTurn(j.ID)...), nil
 }
 
@@ -602,26 +557,30 @@ func endTurn(id string) []string {
 	}
 }
 
-func notifyParams(every, match string) (time.Duration, error) {
-	if every == "" {
-		every = "30s"
-	}
-	d, err := time.ParseDuration(every)
-	if err != nil {
-		return 0, fail(`use a Go duration such as "30s" or "2m"`, "every %q: %v", every, err)
-	}
-	if match != "" {
-		if _, err := regexp.Compile(match); err != nil {
-			return 0, fail("fix the regex (Go RE2 syntax)", "match: %v", err)
+// notifyOpts parses and validates notifier params (param: the interval's name in this tool) into
+// NotifierOpts with the effective defaults filled in. after is the follower's start cursor (-1 = now).
+func notifyOpts(param, every, match string, after int64) (follow.NotifierOpts, error) {
+	n := follow.NotifierOpts{Match: match, After: after}
+	if every != "" {
+		d, err := time.ParseDuration(every)
+		if err != nil {
+			return n, fail(`use a Go duration such as "30s" or "2m"`, "%s %q: %v", param, every, err)
 		}
+		n.Every = d
 	}
-	return d, nil
+	if _, err := regexp.Compile(match); err != nil {
+		return n, fail("fix the regex (Go RE2 syntax)", "match: %v", err)
+	}
+	if err := n.Validate(); err != nil {
+		return n, fail(fmt.Sprintf(`pass %s="30s" (the default) or any interval of at least 5s`, param), "%v", err)
+	}
+	return n, nil
 }
 
-// notify starts (or replaces) the job's notifier to this T3 thread. after is the follower's start
-// cursor (-1 = current max).
-func (h *server) notify(id string, every time.Duration, match string, after int64) error {
-	_, err := startNotifier(h.s, id, follow.NotifierOpts{Every: every, Match: match, MaxLines: 10, After: after, Deliver: "t3:" + h.thread})
+// notify starts (or replaces) the job's notifier to this T3 thread.
+func (h *server) notify(id string, n follow.NotifierOpts) error {
+	n.Deliver = "t3:" + h.thread
+	_, err := startNotifier(h.s, id, n)
 	return err
 }
 
@@ -630,26 +589,6 @@ func (h *server) notify(id string, every time.Duration, match string, after int6
 type JobsIn struct {
 	Caller
 	All bool `json:"all,omitempty" jsonschema:"list every owner's jobs, not just yours"`
-}
-
-type jobRow struct {
-	ID         string `toon:"id"`
-	Name       string `toon:"name"`
-	Status     string `toon:"status"`
-	Lines      int64  `toon:"lines"`
-	LastOutput string `toon:"last_output"`
-	Source     string `toon:"source"`
-}
-
-// jobRowAll is jobRow plus owner (the TOON encoder does not flatten embedded structs).
-type jobRowAll struct {
-	ID         string `toon:"id"`
-	Name       string `toon:"name"`
-	Status     string `toon:"status"`
-	Lines      int64  `toon:"lines"`
-	LastOutput string `toon:"last_output"`
-	Source     string `toon:"source"`
-	Owner      string `toon:"owner"`
 }
 
 func (h *server) jobsList(_ context.Context, in JobsIn) (string, error) {
@@ -669,21 +608,16 @@ func (h *server) jobsList(_ context.Context, in JobsIn) (string, error) {
 		}
 		return kv(f("jobs", "0 jobs "+scope)) + helpBlock(help...), nil
 	}
-	var t table
-	if in.All {
-		rows := make([]jobRowAll, len(js))
-		for i, j := range js {
-			r := jobRowOf(j)
-			rows[i] = jobRowAll{r.ID, r.Name, r.Status, r.Lines, r.LastOutput, r.Source, j.Owner}
+	rows := make([]toon.Object, len(js))
+	for i, j := range js {
+		fs := []toon.Field{f("id", j.ID), f("name", store.OneLine(j.Name)), f("status", store.Clip(j.StatusText(), 80)), f("lines", j.Lines),
+			f("last_output", store.Ago(j.LastTS, "never")), f("source", store.Clip(store.OneLine(j.Describe), 80))}
+		if in.All {
+			fs = append(fs, f("owner", j.Owner))
 		}
-		t = newTable("jobs", rows, len(rows))
-	} else {
-		rows := make([]jobRow, len(js))
-		for i, j := range js {
-			rows[i] = jobRowOf(j)
-		}
-		t = newTable("jobs", rows, len(rows))
+		rows[i] = toon.NewObject(fs...)
 	}
+	t := newTable("jobs", rows, len(rows))
 	return render(kv(f("count", plural(len(js), "job", "jobs")+" "+scope+" · newest first")), t, func(shown int) string {
 		help := []string{"tail_read job=<id> after=<cursor> reads output", "tail_stop job=<id> stops a job"}
 		if shown < len(js) {
@@ -691,11 +625,6 @@ func (h *server) jobsList(_ context.Context, in JobsIn) (string, error) {
 		}
 		return helpBlock(help...)
 	}), nil
-}
-
-func jobRowOf(j store.Job) jobRow {
-	return jobRow{ID: j.ID, Name: store.OneLine(j.Name), Status: deliver.Clip(store.StatusText(j.Status, j.ExitCode, j.Error), 80),
-		Lines: j.Lines, LastOutput: ago(j.LastTS), Source: deliver.Clip(store.OneLine(j.Describe), 80)}
 }
 
 // ---- tail_read
@@ -712,14 +641,9 @@ type ReadIn struct {
 // jobSummary is the aggregate header of a job: status with exit code, line count, last output.
 func (h *server) jobSummary(j store.Job) string {
 	_ = h.s.Stats(&j)
-	if cur, err := h.s.GetJob(j.ID, ""); err == nil { // fresh status, exit code and error
-		j.Status, j.ExitCode, j.Error = cur.Status, cur.ExitCode, cur.Error
-	}
-	st := deliver.Clip(store.StatusText(jobs.Status(h.s, j), j.ExitCode, j.Error), 300)
-	return fmt.Sprintf("%s · %s · %d lines total · last output %s", label(j), st, j.Lines, ago(j.LastTS))
+	j, _ = jobs.Refresh(h.s, j) // fresh effective status, exit code and error; keeps the stats
+	return fmt.Sprintf("%s · %s · %d lines total · last output %s", j.Label(), store.Clip(j.StatusText(), 300), j.Lines, store.Ago(j.LastTS, "never"))
 }
-
-func ended(st string) bool { return st != "running" && st != "starting" }
 
 func (h *server) read(_ context.Context, in ReadIn) (string, error) {
 	j, err := h.job(in.Job, h.owner(in.Caller))
@@ -740,14 +664,14 @@ func (h *server) read(_ context.Context, in ReadIn) (string, error) {
 		return "", err
 	}
 	head := dataNote + "\n" + kv(f("job", h.jobSummary(j)))
-	return render(head, lineTable("lines", ls), func(shown int) string {
+	return render(head, lineTable("lines", ls, false), func(shown int) string {
 		if shown == 0 {
 			what := "new lines"
 			if in.Grep != "" {
 				what = "new lines matching the grep"
 			}
 			out := kv(f("lines", fmt.Sprintf("0 %s after cursor %d", what, in.After)), f("cursor", in.After))
-			if !ended(jobs.Status(h.s, j)) {
+			if store.Live(jobs.Status(h.s, j)) {
 				out += helpBlock(fmt.Sprintf("tail_wait job=%s until=<regex> after=%d blocks until a matching line arrives", j.ID, in.After))
 			}
 			return out
@@ -804,25 +728,25 @@ func (h *server) wait(ctx context.Context, in WaitIn) (string, error) {
 	re := "/" + in.Until + "/"
 	switch code {
 	case 0:
-		head := dataNote + "\n" + kv(f("wait", fmt.Sprintf("matched %s in job %s", re, label(j))))
-		return render(head, lineTable("lines", ls), func(shown int) string {
+		head := dataNote + "\n" + kv(f("wait", fmt.Sprintf("matched %s in job %s", re, j.Label())))
+		return render(head, lineTable("lines", ls, false), func(shown int) string {
 			if shown > 0 {
 				cursor = ls[shown-1].ID
 			}
 			return kv(f("cursor", cursor), f("next", fmt.Sprintf("pass after=%d to read or wait for newer lines only", cursor)))
 		}), nil
-	case 3:
+	case follow.WaitTimeout:
 		last, _ := h.s.Read(store.ReadQuery{Job: j.ID, Tail: 3, Limit: 3})
 		head := dataNote + "\n" + kv(f("wait", fmt.Sprintf("timed out after %s; no line matched %s", timeout, re)), f("job", h.jobSummary(j)))
-		return render(head, lineTable("last_lines", last), func(int) string {
+		return render(head, lineTable("last_lines", last, false), func(int) string {
 			return kv(f("cursor", cursor)) + helpBlock(
 				fmt.Sprintf("tail_wait job=%s until=%q after=%d keeps waiting", j.ID, in.Until, cursor),
 				fmt.Sprintf("tail_notify job=%s match=%q wakes you when it appears (better for long waits)", j.ID, in.Until))
 		}), nil
-	default: // 4: the job ended without a match
+	default: // follow.WaitEnded: the job ended without a match
 		last, _ := h.s.Read(store.ReadQuery{Job: j.ID, Tail: 5, Limit: 5})
 		head := dataNote + "\n" + kv(f("wait", fmt.Sprintf("job ended without a line matching %s", re)), f("job", h.jobSummary(j)))
-		return render(head, lineTable("last_lines", last), func(int) string {
+		return render(head, lineTable("last_lines", last, false), func(int) string {
 			return kv(f("cursor", cursor))
 		}), nil
 	}
@@ -851,7 +775,7 @@ func (h *server) search(_ context.Context, in SearchIn) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		q.Job, scope = j.ID, "job "+label(j)
+		q.Job, scope = j.ID, "job "+j.Label()
 	}
 	if in.Since != "" {
 		d, err := time.ParseDuration(in.Since)
@@ -872,12 +796,8 @@ func (h *server) search(_ context.Context, in SearchIn) (string, error) {
 		}
 		return kv(f("lines", fmt.Sprintf("0 matches for '%s' in %s", in.Query, scope))) + helpBlock(help...), nil
 	}
-	rows := make([]jobLineRow, len(ls))
-	for i, l := range ls {
-		rows[i] = jobLineRow{l.ID, l.Job, hhmmss(l.TS), l.Text}
-	}
 	head := dataNote + "\n" + kv(f("count", fmt.Sprintf("%s for '%s' in %s · newest first", plural(len(ls), "match", "matches"), in.Query, scope)))
-	return render(head, newTable("lines", rows, len(rows)), func(shown int) string {
+	return render(head, lineTable("lines", ls, true), func(shown int) string {
 		if shown < len(ls) {
 			return kv(f("more", fmt.Sprintf("%d of %d lines shown, down to id %d (output budget); narrow with job, since, limit or the query",
 				shown, len(ls), ls[shown-1].ID)))

@@ -12,9 +12,9 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/ncruces/go-sqlite3"
 	_ "github.com/ncruces/go-sqlite3/driver"
@@ -32,11 +32,6 @@ const DBFile = "tail-mode.db"
 
 // BusyTimeout is how long a connection waits for another writer's lock. Tests shorten it.
 var BusyTimeout = 10 * time.Second
-
-// ExitError makes main exit with Code without printing anything.
-type ExitError struct{ Code int }
-
-func (e ExitError) Error() string { return fmt.Sprintf("exit %d", e.Code) }
 
 var ErrNotFound = errors.New("job not found")
 
@@ -281,28 +276,36 @@ func (s *Store) Append(job string, texts []string, ts int64) error {
 	return tx.Commit()
 }
 
-// truncate cuts t to at most MaxLineBytes on a rune boundary and marks the cut.
+// truncate cuts t to at most MaxLineBytes on a rune boundary and marks the cut ("…[truncated]").
 func truncate(t string) string {
 	if len(t) <= MaxLineBytes {
 		return t
 	}
-	i := MaxLineBytes
-	for i > 0 && !utf8.RuneStart(t[i]) {
-		i--
-	}
-	return t[:i] + "…[truncated]"
+	return Clip(t, MaxLineBytes) + "[truncated]"
 }
 
-// MaxID is the current cursor for job ("" = all jobs).
+// MaxID is the current cursor for job.
 func (s *Store) MaxID(job string) (int64, error) {
 	var id int64
-	var err error
-	if job == "" {
-		err = s.db.QueryRow(`SELECT COALESCE(MAX(id),0) FROM lines`).Scan(&id)
-	} else {
-		err = s.db.QueryRow(`SELECT COALESCE(MAX(id),0) FROM lines WHERE job=?`, job).Scan(&id)
-	}
+	err := s.db.QueryRow(`SELECT COALESCE(MAX(id),0) FROM lines WHERE job=?`, job).Scan(&id)
 	return id, err
+}
+
+// scanLines reads (id, job, ts, text) rows, keeping those keep accepts (nil = all), until max are kept
+// (max <= 0 = no limit).
+func scanLines(rows *sql.Rows, keep func(Line) bool, max int) ([]Line, error) {
+	defer rows.Close()
+	var out []Line
+	for (max <= 0 || len(out) < max) && rows.Next() {
+		var l Line
+		if err := rows.Scan(&l.ID, &l.Job, &l.TS, &l.Text); err != nil {
+			return nil, err
+		}
+		if keep == nil || keep(l) {
+			out = append(out, l)
+		}
+	}
+	return out, rows.Err()
 }
 
 type ReadQuery struct {
@@ -331,28 +334,19 @@ func (s *Store) Read(q ReadQuery) ([]Line, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	want := q.Limit
 	if q.Tail > 0 {
 		want = min(q.Tail, q.Limit)
 	}
-	var out []Line
-	for rows.Next() && len(out) < want {
-		var l Line
-		if err := rows.Scan(&l.ID, &l.Job, &l.TS, &l.Text); err != nil {
-			return nil, err
-		}
-		if q.Grep != nil && !q.Grep.MatchString(l.Text) {
-			continue
-		}
-		out = append(out, l)
+	var keep func(Line) bool
+	if q.Grep != nil {
+		keep = func(l Line) bool { return q.Grep.MatchString(l.Text) }
 	}
-	if q.Tail > 0 && q.Grep != nil { // collected newest-first
-		for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
-			out[i], out[j] = out[j], out[i]
-		}
+	out, err := scanLines(rows, keep, want)
+	if err == nil && q.Tail > 0 && q.Grep != nil { // collected newest-first
+		slices.Reverse(out)
 	}
-	return out, rows.Err()
+	return out, err
 }
 
 type SearchQuery struct {
@@ -377,16 +371,7 @@ func (s *Store) Search(q SearchQuery) ([]Line, error) {
 		if err != nil {
 			return nil, err
 		}
-		defer rows.Close()
-		var out []Line
-		for rows.Next() {
-			var l Line
-			if err := rows.Scan(&l.ID, &l.Job, &l.TS, &l.Text); err != nil {
-				return nil, err
-			}
-			out = append(out, l)
-		}
-		return out, rows.Err()
+		return scanLines(rows, nil, 0)
 	}
 	out, err := run(q.Query)
 	if err != nil { // most likely FTS5 syntax: retry as a literal phrase

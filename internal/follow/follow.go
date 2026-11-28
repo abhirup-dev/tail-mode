@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
-	"syscall"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
@@ -22,10 +21,17 @@ import (
 	"github.com/abhirup-dev/tail-mode/internal/store"
 )
 
+const (
+	DefaultEvery    = 30 * time.Second
+	DefaultMaxLines = 10
+	WaitTimeout     = 3 // WaitCursor codes (and CLI exit codes); a match is 0
+	WaitEnded       = 4
+)
+
 type Options struct {
-	Every    time.Duration  // min 5s
+	Every    time.Duration  // callers validate it (NotifierOpts.Validate); Follow floors it at 5s
 	Match    *regexp.Regexp // nil = all lines
-	MaxLines int            // default 10
+	MaxLines int            // default DefaultMaxLines
 	After    int64          // -1 = job's current max id
 }
 
@@ -50,16 +56,15 @@ const (
 	maxText  = 300
 )
 
-// liveStatus refreshes job with its effective status (jobs.Status) and reports whether it has not ended.
+// liveStatus refreshes job with its effective status (jobs.Refresh) and reports whether it has not ended.
 // "lost" counts as ended.
 func liveStatus(s *store.Store, job *store.Job) (running bool, err error) {
-	j, err := s.GetJob(job.ID, "")
+	j, err := jobs.Refresh(s, *job)
 	if err != nil {
 		return false, err
 	}
-	j.Status = jobs.Status(s, j)
 	*job = j
-	return j.Status == "running" || j.Status == "starting", nil
+	return store.Live(j.Status), nil
 }
 
 func startCursor(s *store.Store, job string, after int64) (int64, error) {
@@ -77,7 +82,7 @@ func Follow(ctx context.Context, s *store.Store, job store.Job, o Options, sink 
 		o.Every = minEvery
 	}
 	if o.MaxLines <= 0 {
-		o.MaxLines = 10
+		o.MaxLines = DefaultMaxLines
 	}
 	cursor, err := startCursor(s, job.ID, o.After)
 	if err != nil {
@@ -186,18 +191,13 @@ func deliverFinal(ctx context.Context, sink deliver.Sink, d deliver.Digest) erro
 }
 
 func toLine(l store.Line) deliver.Line {
-	return deliver.Line{ID: l.ID, TS: l.TS, Text: deliver.Clip(l.Text, maxText)}
+	return deliver.Line{ID: l.ID, TS: l.TS, Text: store.Clip(l.Text, maxText)}
 }
 
-// Wait polls every second until a line after `after` matches until (exit 0, ≤20 lines), the timeout
-// passes (3), or the job ends without a match (4). timeout 0 = none.
-func Wait(ctx context.Context, s *store.Store, job store.Job, until *regexp.Regexp, timeout time.Duration, after int64) ([]store.Line, int, error) {
-	lines, code, _, err := WaitCursor(ctx, s, job, until, timeout, after)
-	return lines, code, err
-}
-
-// WaitCursor is Wait that also returns the cursor reached: the last matching line on a match, else
-// the last line checked, so waiting again from it misses nothing.
+// WaitCursor polls every second until a line after `after` matches until (code 0, ≤20 lines), the
+// timeout passes (WaitTimeout), or the job ends without a match (WaitEnded). timeout 0 = none. It also
+// returns the cursor reached: the last matching line on a match, else the last line checked, so
+// waiting again from it misses nothing.
 func WaitCursor(ctx context.Context, s *store.Store, job store.Job, until *regexp.Regexp, timeout time.Duration, after int64) ([]store.Line, int, int64, error) {
 	cursor, err := startCursor(s, job.ID, after)
 	if err != nil {
@@ -230,12 +230,12 @@ func WaitCursor(ctx context.Context, s *store.Store, job store.Job, until *regex
 			cursor = max
 		}
 		if !running {
-			return nil, 4, cursor, nil
+			return nil, WaitEnded, cursor, nil
 		}
 		select {
 		case <-ctx.Done():
 			if ctx.Err() == context.DeadlineExceeded {
-				return nil, 3, cursor, nil
+				return nil, WaitTimeout, cursor, nil
 			}
 			return nil, 0, cursor, ctx.Err()
 		case <-t.C:
@@ -243,14 +243,35 @@ func WaitCursor(ctx context.Context, s *store.Store, job store.Job, until *regex
 	}
 }
 
-// NotifierOpts configure a detached follower. Zero Every/MaxLines use follow's defaults; After 0 means
-// from the job's first line, -1 its current end. Deliver is a deliver.New spec and is required.
+// NotifierOpts configure a detached follower. Zero Every/MaxLines mean the defaults; After 0 means from
+// the job's first line, -1 its current end. Deliver is a deliver.New spec, required by StartNotifier.
 type NotifierOpts struct {
 	Every    time.Duration
 	Match    string
 	MaxLines int
 	After    int64
 	Deliver  string
+}
+
+// Validate fills in the defaults (so callers report effective values), then rejects an interval below
+// 5s (Follow would raise it silently), a negative MaxLines and a bad Match regex.
+func (o *NotifierOpts) Validate() error {
+	if o.Every == 0 {
+		o.Every = DefaultEvery
+	}
+	if o.MaxLines == 0 {
+		o.MaxLines = DefaultMaxLines
+	}
+	if o.Every < minEvery {
+		return fmt.Errorf("every must be ≥ %s (got %s)", minEvery, o.Every)
+	}
+	if o.MaxLines < 0 {
+		return fmt.Errorf("max lines must be positive (got %d)", o.MaxLines)
+	}
+	if _, err := regexp.Compile(o.Match); err != nil {
+		return fmt.Errorf("match: %w", err)
+	}
+	return nil
 }
 
 // NotifierLock is the liveness lock of the follower for (job, deliver): <dir>/run/n-<job>-<hash>.lock.
@@ -284,21 +305,12 @@ func Register(s *store.Store, job, deliver string) (release func(), err error) {
 // only while it holds its lock, so the recorded pid is still ours.
 func stopNotifier(s *store.Store, job, deliver string) error {
 	n, ok, err := s.GetNotifier(job, deliver)
-	if err != nil || !ok || n.PID <= 0 {
+	if err != nil || !ok {
 		return err
-	}
-	lock := NotifierLock(s, job, deliver)
-	if !proc.Locked(lock) {
-		return nil
 	}
 	// shortcut: a successor that has locked but not yet written its row leaves a stale pid for a few
 	// ms; signalling it is harmless unless that pid was recycled in between.
-	_ = syscall.Kill(n.PID, syscall.SIGTERM)
-	if proc.WaitUnlocked(lock, stopWait) {
-		return nil
-	}
-	_ = syscall.Kill(n.PID, syscall.SIGKILL)
-	if !proc.WaitUnlocked(lock, time.Second) {
+	if !proc.Terminate(n.PID, NotifierLock(s, job, deliver), false, stopWait) {
 		return fmt.Errorf("previous notifier pid %d for %s → %s did not stop", n.PID, job, deliver)
 	}
 	return nil
@@ -314,23 +326,18 @@ func StartNotifier(s *store.Store, job string, o NotifierOpts) (int, error) {
 	if _, err := deliver.New(o.Deliver); err != nil {
 		return 0, err
 	}
-	if _, err := regexp.Compile(o.Match); err != nil {
+	if err := o.Validate(); err != nil {
 		return 0, err
 	}
 	if err := stopNotifier(s, job, o.Deliver); err != nil {
 		return 0, err
 	}
-	args := []string{"follow", "--notifier", "--deliver=" + o.Deliver, "--after=" + strconv.FormatInt(o.After, 10)}
-	if o.Every > 0 {
-		args = append(args, "--every="+o.Every.String())
-	}
-	if o.MaxLines > 0 {
-		args = append(args, "--max-lines="+strconv.Itoa(o.MaxLines))
-	}
+	args := []string{"follow", "--notifier", "--deliver=" + o.Deliver, "--after=" + strconv.FormatInt(o.After, 10),
+		"--every=" + o.Every.String(), "--max-lines=" + strconv.Itoa(o.MaxLines)}
 	if o.Match != "" {
 		args = append(args, "--match="+o.Match)
 	}
-	pid, err := proc.Detach(append(args, "--", job)...)
+	pid, err := proc.Detach(s.Dir, append(args, "--", job)...)
 	if err != nil {
 		return 0, err
 	}

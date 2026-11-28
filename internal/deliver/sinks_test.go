@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/abhirup-dev/tail-mode/internal/store"
 )
 
 var sample = Digest{Job: "jabc123", Name: "web-1", Host: "prod-1", Status: "running", New: 42, Matched: 3,
@@ -74,7 +76,7 @@ func TestClip(t *testing.T) {
 		{"日本", 4, "日…"},
 		{"日本", 0, "…"},
 	} {
-		if got := Clip(c.in, c.n); got != c.want {
+		if got := store.Clip(c.in, c.n); got != c.want {
 			t.Errorf("Clip(%q, %d) = %q, want %q", c.in, c.n, got, c.want)
 		}
 	}

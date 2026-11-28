@@ -7,6 +7,8 @@ import (
 	"os/exec"
 	"strings"
 	"unicode"
+
+	"al.essio.dev/pkg/shellescape"
 )
 
 func init() {
@@ -69,11 +71,7 @@ func remoteCommand(argv []string) string {
 
 // remoteScript is the decoded script: set the positional parameters to argv, then run the wrapper.
 func remoteScript(argv []string) string {
-	q := make([]string, len(argv))
-	for i, a := range argv {
-		q[i] = Quote(a)
-	}
-	return "set -- " + strings.Join(q, " ") + "\n" + remoteWrapper + "\n"
+	return "set -- " + shellescape.QuoteCommand(argv) + "\n" + remoteWrapper + "\n"
 }
 
 // remoteWrapper runs "$@" so that it cannot outlive the stream. Without a tty sshd never signals the

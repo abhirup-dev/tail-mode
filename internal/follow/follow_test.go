@@ -152,22 +152,22 @@ func TestWait(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 		s.Append(j.ID, []string{"booting", "ready on :8080"}, store.NowMS())
 	}()
-	lines, code, err := Wait(context.Background(), s, j, regexp.MustCompile("ready"), time.Second, -1)
+	lines, code, _, err := WaitCursor(context.Background(), s, j, regexp.MustCompile("ready"), time.Second, -1)
 	if err != nil || code != 0 || len(lines) != 1 {
 		t.Fatalf("match: %v %d %v", lines, code, err)
 	}
-	if _, code, _ = Wait(context.Background(), s, j, regexp.MustCompile("never"), 60*time.Millisecond, -1); code != 3 {
+	if _, code, _, _ = WaitCursor(context.Background(), s, j, regexp.MustCompile("never"), 60*time.Millisecond, -1); code != 3 {
 		t.Fatalf("timeout code %d", code)
 	}
 	s.Finish(j.ID, "exited", 0, "", false)
-	if _, code, _ = Wait(context.Background(), s, j, regexp.MustCompile("never"), time.Second, 0); code != 4 {
+	if _, code, _, _ = WaitCursor(context.Background(), s, j, regexp.MustCompile("never"), time.Second, 0); code != 4 {
 		t.Fatalf("ended code %d", code)
 	}
 }
 
 func TestWaitLostJob(t *testing.T) {
 	s, j := setup(t, false) // running but nobody holds the lock
-	if _, code, _ := Wait(context.Background(), s, j, regexp.MustCompile("x"), time.Second, -1); code != 4 {
+	if _, code, _, _ := WaitCursor(context.Background(), s, j, regexp.MustCompile("x"), time.Second, -1); code != 4 {
 		t.Fatalf("lost code %d", code)
 	}
 }

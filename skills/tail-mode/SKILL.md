@@ -76,7 +76,7 @@ Pitfalls:
 |---|---|---|
 | Run a command | `tail_start {cmd, dir, env?, shell?, login?, host?, name?, notify_every?, notify_match?}` | `tail-mode run [--name N] [--host H] [--dir D] [--env K=V]… [--shell S] [--login] [--every 30s] [--match RE] [--until RE] -- CMD…` |
 | Start | `tail_start {file\|cmd\|source+config, host?, name?, backlog?, restart?}` | `tail-mode start --file PATH [--backlog N]` / `--cmd 'CMD' [--dir D] [--env K=V]… [--shell S] [--login]` / `--source KIND --config JSON`, plus `[--host H \| --transport T --target X] [--name N] [--restart\|--no-restart]` |
-| Block until ready (short waits) | `tail_wait {job, until, timeout? (50s, max 5m), after? (0)}` | `tail-mode wait <job> --until RE [--timeout 30m] [--after 0]` |
+| Block until ready (short waits) | `tail_wait {job, until, timeout? (50s; MCP max 5m, Pi no cap), after? (0)}` | `tail-mode wait <job> --until RE [--timeout 30m] [--after 0]` |
 | New lines | `tail_read {job, after: <cursor>}` | `tail-mode read <job> --after ID [--grep RE] [--tail N]` |
 | Search | `tail_search {query, job?, since: "1h"}` | `tail-mode search 'q' [--job J] [--since 1h]` |
 | SQL | `tail_sql {query}` over `jobs`, `lines(id,job,ts,text)` (one SELECT, 5 s) | `tail-mode sql 'select …'` |

@@ -41,14 +41,32 @@ type StartOpts struct {
 	Transport string // "" = local
 	Target    string
 	Spec      source.Spec
+	Cwd       string // caller's working dir for local defaults; "" = unknown (relative local paths refused)
+}
+
+func (o StartOpts) Local() bool { return o.Transport == "" || o.Transport == "local" }
+
+// Resolve applies source.LocalDefaults against o.Cwd to a local job (remote jobs keep the remote's
+// defaults). Idempotent: Start calls it; integrations call it first to validate and echo the result.
+func (o StartOpts) Resolve() (StartOpts, error) {
+	if !o.Local() {
+		return o, nil
+	}
+	var err error
+	o.Spec, err = source.LocalDefaults(o.Spec, o.Cwd)
+	return o, err
 }
 
 // LockPath is the worker's liveness lock: <dir>/run/<id>.lock.
 func LockPath(s *store.Store, id string) string { return filepath.Join(s.Dir, "run", id+".lock") }
 
-// Start validates the source and transport, creates a "starting" row, launches the detached worker,
-// and waits up to 2 s for it to claim the job. It returns the fresh row.
+// Start applies local defaults (Resolve), validates the source and transport, creates a "starting" row,
+// launches the detached worker, and waits up to 2 s for it to claim the job. It returns the fresh row.
 func Start(s *store.Store, o StartOpts) (store.Job, error) {
+	o, err := o.Resolve()
+	if err != nil {
+		return store.Job{}, err
+	}
 	src, err := source.New(o.Spec)
 	if err != nil {
 		return store.Job{}, err
@@ -70,7 +88,7 @@ func Start(s *store.Store, o StartOpts) (store.Job, error) {
 	if err := s.CreateJob(j); err != nil {
 		return j, err
 	}
-	if _, err := proc.Detach("_job", j.ID); err != nil {
+	if _, err := proc.Detach(s.Dir, "_job", j.ID); err != nil {
 		_ = s.Finish(j.ID, "failed", 0, err.Error(), false)
 		return j, err
 	}
@@ -85,7 +103,7 @@ func Start(s *store.Store, o StartOpts) (store.Job, error) {
 // Status is the effective status: a starting/running job whose worker does not hold its lock is lost
 // ("starting" only after a grace period, since the worker may not have locked yet).
 func Status(s *store.Store, j store.Job) string {
-	if j.Status != "starting" && j.Status != "running" {
+	if !store.Live(j.Status) {
 		return j.Status
 	}
 	if proc.Locked(LockPath(s, j.ID)) {
@@ -115,11 +133,21 @@ func List(s *store.Store, owner string, all bool) ([]store.Job, error) {
 		if st == "lost" {
 			_ = s.Finish(j.ID, "lost", 0, "", false)
 		}
-		if cur, err := s.GetJob(j.ID, ""); err == nil {
-			js[i].Status, js[i].EndedAt, js[i].ExitCode, js[i].Error = cur.Status, cur.EndedAt, cur.ExitCode, cur.Error
-		}
+		js[i], _ = Refresh(s, j)
 	}
 	return js, nil
+}
+
+// Refresh re-reads j's row, keeping j's line stats, and sets its effective Status (also on a read error).
+func Refresh(s *store.Store, j store.Job) (store.Job, error) {
+	cur, err := s.GetJob(j.ID, "")
+	if err != nil {
+		j.Status = Status(s, j)
+		return j, err
+	}
+	cur.Lines, cur.LastID, cur.LastTS = j.Lines, j.LastID, j.LastTS
+	cur.Status = Status(s, cur)
+	return cur, nil
 }
 
 // NotOwnerError is Stop refusing another owner's job without force. It names no flag or param: the
@@ -158,24 +186,15 @@ func Stop(s *store.Store, ref, owner string, force bool) (store.Job, error) {
 	if j.Status != "running" {
 		return j, nil
 	}
-	lock := LockPath(s, j.ID)
-	if j.PID > 0 && proc.Locked(lock) {
-		_ = syscall.Kill(j.PID, syscall.SIGTERM)
-		if !waitUnlocked(lock, stopWait) {
-			// shortcut: the source child has its own process group and survives this until its next
-			// write hits SIGPIPE; record the child's pgid if hung workers become common.
-			_ = syscall.Kill(-j.PID, syscall.SIGKILL)
-			waitUnlocked(lock, time.Second)
-		}
-	}
+	// shortcut: on SIGKILL the source child has its own process group and survives until its next write
+	// hits SIGPIPE; record the child's pgid if hung workers become common.
+	proc.Terminate(j.PID, LockPath(s, j.ID), true, stopWait)
 	// Non-force: keep a terminal status the worker wrote itself (stopped, or failed if it dropped lines).
 	if err := s.Finish(j.ID, "stopped", 0, "", false); err != nil {
 		return j, err
 	}
 	return s.GetJob(j.ID, "")
 }
-
-func waitUnlocked(lock string, d time.Duration) bool { return proc.WaitUnlocked(lock, d) }
 
 // Run is the _job worker: lock, claim, then run the source loop. SIGTERM/SIGINT stop it.
 // If the claim fails (stopped while starting) it exits cleanly without running.

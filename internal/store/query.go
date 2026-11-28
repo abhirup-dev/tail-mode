@@ -5,12 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
-	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/ncruces/go-sqlite3"
-	"github.com/ncruces/go-sqlite3/ext/fts5"
 )
 
 // DefaultQueryTimeout bounds Query when ctx has no deadline.
@@ -58,14 +56,13 @@ func (s *Store) Query(ctx context.Context, query string, limit int) (cols []stri
 		ctx, cancel = context.WithTimeout(ctx, DefaultQueryTimeout)
 		defer cancel()
 	}
-	u := url.URL{Scheme: "file", Path: filepath.Join(s.Dir, "tail-mode.db"),
+	u := url.URL{Scheme: "file", Path: s.Path(),
 		RawQuery: "mode=ro&_pragma=busy_timeout(5000)&_pragma=query_only(1)"}
 	conn, err := sqlite3.OpenFlags(u.String(), sqlite3.OPEN_READONLY|sqlite3.OPEN_URI)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer conn.Close()
-	_ = fts5.Register(conn) // so lines_fts is queryable; fails harmlessly if an auto-extension already did it
 	if err := conn.SetAuthorizer(authorize); err != nil {
 		return nil, nil, err
 	}

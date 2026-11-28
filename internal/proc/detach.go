@@ -1,4 +1,4 @@
-// Package proc starts detached tail-mode child processes (job workers, followers) and holds the
+// Package proc starts and stops detached tail-mode child processes (job workers, followers) and holds the
 // lock files that prove a worker is alive.
 package proc
 
@@ -7,18 +7,16 @@ import (
 	"os/exec"
 	"path/filepath"
 	"syscall"
-
-	"github.com/abhirup-dev/tail-mode/internal/store"
+	"time"
 )
 
 // Detach re-execs this binary with args in a new session, stdin /dev/null, stdout/stderr appended to
-// <store dir>/proc.log, and returns its pid without waiting. The child outlives the caller.
-func Detach(args ...string) (int, error) {
+// <dir>/proc.log (dir: the state dir), and returns its pid without waiting. The child outlives the caller.
+func Detach(dir string, args ...string) (int, error) {
 	exe, err := os.Executable()
 	if err != nil {
 		return 0, err
 	}
-	dir := store.Dir()
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return 0, err
 	}
@@ -36,4 +34,22 @@ func Detach(args ...string) (int, error) {
 	pid := cmd.Process.Pid
 	go cmd.Wait() // reap if we live long enough (e.g. inside the MCP server)
 	return pid, nil
+}
+
+// Terminate ends pid, the holder of lockPath: SIGTERM, wait ≤ grace for the lock to free, then SIGKILL
+// (its process group if group) and wait ≤ 1 s. It signals only while the lock is held (PID-reuse safe)
+// and reports whether the lock is free.
+func Terminate(pid int, lockPath string, group bool, grace time.Duration) bool {
+	if pid <= 0 || !Locked(lockPath) {
+		return true
+	}
+	_ = syscall.Kill(pid, syscall.SIGTERM)
+	if WaitUnlocked(lockPath, grace) {
+		return true
+	}
+	if group {
+		pid = -pid
+	}
+	_ = syscall.Kill(pid, syscall.SIGKILL)
+	return WaitUnlocked(lockPath, time.Second)
 }

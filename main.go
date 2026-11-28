@@ -7,12 +7,11 @@ import (
 	"os"
 
 	"github.com/abhirup-dev/tail-mode/internal/cli"
-	"github.com/abhirup-dev/tail-mode/internal/store"
 )
 
 func main() {
 	if err := cli.Run(os.Args[1:]); err != nil {
-		var ee store.ExitError
+		var ee cli.ExitError
 		if errors.As(err, &ee) {
 			os.Exit(ee.Code)
 		}

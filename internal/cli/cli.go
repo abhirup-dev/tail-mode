@@ -10,11 +10,13 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 	"text/tabwriter"
 	"time"
 
+	"al.essio.dev/pkg/shellescape"
 	"github.com/alecthomas/kong"
 
 	"github.com/abhirup-dev/tail-mode/internal/deliver"
@@ -23,11 +25,15 @@ import (
 	"github.com/abhirup-dev/tail-mode/internal/mcpserver"
 	"github.com/abhirup-dev/tail-mode/internal/source"
 	"github.com/abhirup-dev/tail-mode/internal/store"
-	"github.com/abhirup-dev/tail-mode/internal/transport"
 )
 
 // stdout is where command output goes (a test knob).
 var stdout io.Writer = os.Stdout
+
+// ExitError makes main exit with Code without printing anything (wait/run --until: 3 timeout, 4 ended).
+type ExitError struct{ Code int }
+
+func (e ExitError) Error() string { return fmt.Sprintf("exit %d", e.Code) }
 
 type root struct {
 	Start  startCmd  `cmd:"" help:"Start a tail job."`
@@ -48,6 +54,7 @@ func parse(r *root, args []string) (*kong.Context, error) {
 	p, err := kong.New(r, kong.Name("tail-mode"),
 		kong.Description("Tail local/remote logs and commands for coding agents."),
 		kong.Writers(stdout, os.Stderr),
+		kong.Vars{"every": follow.DefaultEvery.String(), "maxLines": strconv.Itoa(follow.DefaultMaxLines)},
 		kong.WithHyphenPrefixedParameters(true)) // flag values may start with "-": --after -1, --grep -x
 	if err != nil {
 		return nil, err
@@ -66,18 +73,6 @@ func Run(args []string) error {
 	}
 	return ctx.Run()
 }
-
-func Start(args []string) error  { return Run(append([]string{"start"}, args...)) }
-func Stop(args []string) error   { return Run(append([]string{"stop"}, args...)) }
-func Jobs(args []string) error   { return Run(append([]string{"jobs"}, args...)) }
-func Job(args []string) error    { return Run(append([]string{"_job"}, args...)) }
-func Read(args []string) error   { return Run(append([]string{"read"}, args...)) }
-func Search(args []string) error { return Run(append([]string{"search"}, args...)) }
-func SQL(args []string) error    { return Run(append([]string{"sql"}, args...)) }
-func Follow(args []string) error { return Run(append([]string{"follow"}, args...)) }
-func Wait(args []string) error   { return Run(append([]string{"wait"}, args...)) }
-func Notify(args []string) error { return Run(append([]string{"notify"}, args...)) }
-func MCP(args []string) error    { return Run(append([]string{"mcp"}, args...)) }
 
 // ---- start / run / stop / jobs / _job
 
@@ -101,35 +96,59 @@ type cmdOpts struct {
 	Login bool     `help:"With a command: run it in a login shell (-lc), so profile files set PATH."`
 }
 
-func (o cmdOpts) given() bool { return o.Dir != "" || len(o.Env) > 0 || o.Shell != "" || o.Login }
-
-func (o cmdOpts) config(cmd string) (source.CmdConfig, error) {
-	c := source.CmdConfig{Cmd: cmd, Dir: o.Dir, Shell: o.Shell, Login: o.Login}
+// spec adds the cmd options to in (--env split at the first "=") and builds the source spec, with the
+// builder's errors reworded in flag names.
+func (o cmdOpts) spec(in source.SpecInput) (source.Spec, error) {
+	in.Dir, in.Shell, in.Login = o.Dir, o.Shell, o.Login
 	for _, kv := range o.Env {
 		k, v, ok := strings.Cut(kv, "=")
 		if !ok {
-			return c, fmt.Errorf("--env %q: want K=V", kv)
+			return source.Spec{}, fmt.Errorf("--env %q: want K=V", kv)
 		}
-		if c.Env == nil {
-			c.Env = map[string]string{}
+		if in.Env == nil {
+			in.Env = map[string]string{}
 		}
-		c.Env[k] = v
+		in.Env[k] = v
 	}
-	return c, nil
+	sp, err := in.Spec()
+	switch {
+	case errors.Is(err, source.ErrBacklogNeedsFile):
+		err = errors.New("--backlog needs --file")
+	case errors.Is(err, source.ErrConfigNeedsSource):
+		err = errors.New("--config needs --source")
+	case errors.Is(err, source.ErrCmdOptionsNeedCmd):
+		err = errors.New("--dir, --env, --shell and --login need --cmd (with --source, put them in --config)")
+	case errors.Is(err, source.ErrConfigInvalidJSON):
+		err = errors.New("--config is not valid JSON")
+	}
+	return sp, err
 }
 
-// withLocalDefaults applies the adapter's local defaults (cwd as the cmd dir, absolute file paths) when
-// the job runs locally; a remote job keeps the remote's defaults (home dir).
-func withLocalDefaults(o jobs.StartOpts) (jobs.StartOpts, error) {
-	if o.Transport != "" && o.Transport != "local" {
-		return o, nil
+// startOpts are StartOpts for a job on host ("" = local) started from this process's cwd.
+func startOpts(name, owner, host string, sp source.Spec) jobs.StartOpts {
+	o := jobs.StartOpts{Name: name, Owner: owner, Spec: sp}
+	if host != "" {
+		o.Transport, o.Target = "ssh", host
 	}
-	cwd, err := os.Getwd()
+	o.Cwd, _ = os.Getwd() // "" if unavailable: relative local paths are then refused
+	return o
+}
+
+// start resolves o's local defaults, starts the job and prints it.
+func start(s *store.Store, o jobs.StartOpts, asJSON bool) (store.Job, error) {
+	o, err := o.Resolve()
 	if err != nil {
-		return o, err
+		return store.Job{}, err
 	}
-	o.Spec, err = source.LocalDefaults(o.Spec, cwd)
-	return o, err
+	j, err := startJob(s, o)
+	if err != nil {
+		return j, err
+	}
+	if asJSON {
+		return j, printJSON(j)
+	}
+	fmt.Fprintf(stdout, "%s started (pid %d): %s\n", j.Label(), j.PID, store.OneLine(j.Describe))
+	return j, nil
 }
 
 type startCmd struct {
@@ -148,46 +167,19 @@ type startCmd struct {
 	JSON      bool `name:"json" help:"JSON output."`
 }
 
-// opts turns the flags (and their sugar) into jobs.StartOpts.
+// opts turns the flags (and their sugar) into jobs.StartOpts (local defaults not yet applied).
 func (c *startCmd) opts() (jobs.StartOpts, error) {
-	o := jobs.StartOpts{Name: c.Name, Owner: c.Owner, Transport: c.Transport, Target: c.Target, Spec: source.Spec{Restart: c.Restart}}
-	if c.Host != "" {
-		o.Transport, o.Target = "ssh", c.Host
+	in := source.SpecInput{CmdConfig: source.CmdConfig{Cmd: c.Cmd}, File: c.File, Backlog: c.Backlog, Source: c.Source, Restart: c.Restart}
+	if c.Config != "" {
+		in.Config = json.RawMessage(c.Config)
 	}
-	if c.Backlog != nil && c.File == "" {
-		return o, errors.New("--backlog needs --file")
+	sp, err := c.cmdOpts.spec(in)
+	if err != nil {
+		return jobs.StartOpts{}, err
 	}
-	if c.Config != "" && c.Source == "" {
-		return o, errors.New("--config needs --source")
-	}
-	if c.cmdOpts.given() && c.Cmd == "" {
-		return o, errors.New("--dir, --env, --shell and --login need --cmd (with --source, put them in --config)")
-	}
-	var cfg any
-	switch {
-	case c.File != "":
-		o.Spec.Kind, cfg = "file", source.FileConfig{Path: c.File, Backlog: c.Backlog}
-	case c.Cmd != "":
-		cc, err := c.cmdOpts.config(c.Cmd)
-		if err != nil {
-			return o, err
-		}
-		o.Spec.Kind, cfg = "cmd", cc
-	default:
-		o.Spec.Kind = c.Source
-		if c.Config != "" {
-			if !json.Valid([]byte(c.Config)) {
-				return o, errors.New("--config is not valid JSON")
-			}
-			o.Spec.Config = json.RawMessage(c.Config)
-		}
-	}
-	if cfg != nil {
-		b, err := json.Marshal(cfg)
-		if err != nil {
-			return o, err
-		}
-		o.Spec.Config = b
+	o := startOpts(c.Name, c.Owner, c.Host, sp)
+	if c.Host == "" {
+		o.Transport, o.Target = c.Transport, c.Target
 	}
 	return o, nil
 }
@@ -197,23 +189,13 @@ func (c *startCmd) Run() error {
 	if err != nil {
 		return err
 	}
-	if o, err = withLocalDefaults(o); err != nil {
-		return err
-	}
 	s, err := store.Open("")
 	if err != nil {
 		return err
 	}
 	defer s.Close()
-	j, err := startJob(s, o)
-	if err != nil {
-		return err
-	}
-	if c.JSON {
-		return printJSON(j)
-	}
-	fmt.Fprintf(stdout, "%s started (pid %d): %s\n", label(j), j.PID, store.OneLine(j.Describe))
-	return nil
+	_, err = start(s, o, c.JSON)
+	return err
 }
 
 type runCmd struct {
@@ -221,9 +203,9 @@ type runCmd struct {
 	Host     string `placeholder:"H" help:"Run over ssh on this host (default local)."`
 	cmdOpts  `embed:""`
 	ownerOpt `embed:""`
-	Every    time.Duration `placeholder:"30s" help:"Notify with digests this often (starts a notifier; min 5s)."`
-	Match    string        `placeholder:"RE" help:"Notify only on lines matching this regex (starts a notifier; default every 30s)."`
-	MaxLines int           `default:"10" help:"Lines per digest."`
+	Every    time.Duration `placeholder:"${every}" help:"Notify with digests this often (starts a notifier; min 5s)."`
+	Match    string        `placeholder:"RE" help:"Notify only on lines matching this regex (starts a notifier; default every ${every})."`
+	MaxLines int           `default:"${maxLines}" help:"Lines per digest."`
 	Deliver  string        `xor:"dest" help:"Notifier sink, e.g. t3:THREAD (default t3:$T3CODE_THREAD_ID)." placeholder:"SPEC"`
 	Thread   string        `xor:"dest" help:"T3 thread id for the notifier (default $T3CODE_THREAD_ID)." placeholder:"ID"`
 	Until    string        `placeholder:"RE" help:"Block until a line matches (exit 0; 3 on timeout; 4 if the job ended). The job keeps running."`
@@ -238,11 +220,7 @@ func command(argv []string) string {
 	if len(argv) == 1 {
 		return argv[0]
 	}
-	q := make([]string, len(argv))
-	for i, a := range argv {
-		q[i] = transport.Quote(a)
-	}
-	return strings.Join(q, " ")
+	return shellescape.QuoteCommand(argv)
 }
 
 func (c *runCmd) Run() error {
@@ -261,27 +239,17 @@ func (c *runCmd) Run() error {
 	if err != nil {
 		return err
 	}
-	wantNotify := c.Every > 0 || match != nil
+	wantNotify := c.Every != 0 || match != nil
 	if !wantNotify && (c.Deliver != "" || c.Thread != "") {
 		return errors.New("--deliver/--thread need --every or --match")
 	}
-	every := c.Every
-	if every == 0 {
-		every = 30 * time.Second
-	}
-	cc, err := c.cmdOpts.config(command(argv))
-	if err != nil {
+	// After 0: the job is new, so the notifier sees all of its lines, including fast early output.
+	n := follow.NotifierOpts{Every: c.Every, Match: c.Match, MaxLines: c.MaxLines, After: 0}
+	if err := n.Validate(); wantNotify && err != nil { // before starting, so a bad flag leaves no job
 		return err
 	}
-	raw, err := json.Marshal(cc)
+	sp, err := c.cmdOpts.spec(source.SpecInput{CmdConfig: source.CmdConfig{Cmd: command(argv)}})
 	if err != nil {
-		return err
-	}
-	o := jobs.StartOpts{Name: c.Name, Owner: c.Owner, Spec: source.Spec{Kind: "cmd", Config: raw}}
-	if c.Host != "" {
-		o.Transport, o.Target = "ssh", c.Host
-	}
-	if o, err = withLocalDefaults(o); err != nil {
 		return err
 	}
 	s, err := store.Open("")
@@ -289,53 +257,41 @@ func (c *runCmd) Run() error {
 		return err
 	}
 	defer s.Close()
-	j, err := startJob(s, o)
+	j, err := start(s, startOpts(c.Name, c.Owner, c.Host, sp), c.JSON)
 	if err != nil {
 		return err
 	}
-	if c.JSON {
-		b, _ := json.Marshal(j)
-		fmt.Fprintln(stdout, string(b))
-	} else {
-		fmt.Fprintf(stdout, "%s started (pid %d): %s\n", label(j), j.PID, store.OneLine(j.Describe))
-	}
-
 	if wantNotify {
-		// After 0: the job is new, so the notifier sees all of its lines, including fast early output.
-		spec := resolveDeliver(c.Deliver, c.Thread)
-		var msg string
-		if spec == "" {
-			msg = deliver.Recipe(j.ID, every, c.Match, 0)
-		} else {
-			pid, err := startNotifier(s, j.ID, follow.NotifierOpts{Every: every, Match: c.Match, MaxLines: c.MaxLines, After: 0, Deliver: spec})
-			if err != nil {
-				return fmt.Errorf("job %s started, but its notifier did not: %w", j.ID, err)
-			}
-			msg = fmt.Sprintf("notifier pid %d: digests every %s to %s", pid, every, spec)
-		}
-		if c.JSON {
-			b, _ := json.Marshal(map[string]string{"notify": msg})
-			fmt.Fprintln(stdout, string(b))
-		} else {
-			fmt.Fprintln(stdout, msg)
+		if err := c.notify(s, j.ID, n); err != nil {
+			return err
 		}
 	}
-
 	if until == nil {
 		return nil
 	}
-	ctx, stop := signalCtx()
-	defer stop()
 	// After 0, not -1: jobs.Start returns after the worker claims the job, so a fast "ready" line may
 	// already be stored.
-	lines, code, err := follow.Wait(ctx, s, j, until, c.Timeout, 0)
-	if err != nil {
-		return err
+	return wait(s, j, until, c.Timeout, 0, c.JSON)
+}
+
+// notify starts run's notifier for job (deliver resolved like notify), or prints the recipe when
+// there is no destination.
+func (c *runCmd) notify(s *store.Store, job string, n follow.NotifierOpts) error {
+	var msg string
+	if n.Deliver = resolveDeliver(c.Deliver, c.Thread); n.Deliver == "" {
+		msg = "No T3 thread; to get woken:\n- " + strings.Join(deliver.RecipeLines(job, n.Every, n.Match, n.After), "\n- ")
+	} else {
+		pid, err := startNotifier(s, job, n)
+		if err != nil {
+			return fmt.Errorf("job %s started, but its notifier did not: %w", job, err)
+		}
+		msg = fmt.Sprintf("notifier pid %d: digests every %s to %s", pid, n.Every, n.Deliver)
 	}
-	if code != 0 {
-		return store.ExitError{Code: code}
+	if c.JSON {
+		return printJSON(map[string]string{"notify": msg})
 	}
-	return printLines(lines, c.JSON, false)
+	fmt.Fprintln(stdout, msg)
+	return nil
 }
 
 type stopCmd struct {
@@ -361,7 +317,7 @@ func (c *stopCmd) Run() error {
 	if c.JSON {
 		return printJSON(j)
 	}
-	fmt.Fprintf(stdout, "%s %s\n", label(j), store.StatusText(j.Status, j.ExitCode, j.Error))
+	fmt.Fprintf(stdout, "%s %s\n", j.Label(), j.StatusText())
 	return nil
 }
 
@@ -394,12 +350,8 @@ func (c *jobsCmd) Run() error {
 	}
 	fmt.Fprintln(tw)
 	for _, j := range js {
-		last := "-"
-		if j.LastTS > 0 {
-			last = time.Since(time.UnixMilli(j.LastTS)).Round(time.Second).String() + " ago"
-		}
-		status := deliver.Clip(store.StatusText(j.Status, j.ExitCode, j.Error), 60)
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\t%s", j.ID, store.OneLine(j.Name), status, j.Lines, last, store.OneLine(j.Describe))
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\t%s", j.ID, store.OneLine(j.Name), store.Clip(j.StatusText(), 60), j.Lines,
+			store.Ago(j.LastTS, "-"), store.OneLine(j.Describe))
 		if c.All {
 			fmt.Fprintf(tw, "\t%s", j.Owner)
 		}
@@ -531,9 +483,9 @@ func (c *sqlCmd) Run() error {
 
 type followCmd struct {
 	Job      string        `arg:"" help:"Job id or name."`
-	Every    time.Duration `default:"30s" help:"Poll interval (min 5s)."`
+	Every    time.Duration `default:"${every}" help:"Poll interval (min 5s)."`
 	Match    string        `help:"Only digest lines matching this regex." placeholder:"RE"`
-	MaxLines int           `default:"10" help:"Lines per digest."`
+	MaxLines int           `default:"${maxLines}" help:"Lines per digest."`
 	After    int64         `default:"-1" help:"Start cursor (-1 = the job's current end)." placeholder:"ID"`
 	Deliver  string        `default:"stdout" help:"Sink: stdout | jsonl | t3:THREAD."`
 	Notifier bool          `hidden:"" help:"Internal: register as the one notifier for this job and --deliver (set by notify)."`
@@ -541,6 +493,9 @@ type followCmd struct {
 }
 
 func (c *followCmd) Run() error {
+	if err := (&follow.NotifierOpts{Every: c.Every, Match: c.Match, MaxLines: c.MaxLines}).Validate(); err != nil {
+		return err
+	}
 	re, err := compile(c.Match)
 	if err != nil {
 		return err
@@ -589,23 +544,29 @@ func (c *waitCmd) Run() error {
 		return err
 	}
 	defer s.Close()
+	return wait(s, j, re, c.Timeout, c.After, c.JSON)
+}
+
+// wait blocks until a line of j after cursor after matches until and prints the matches; a timeout or
+// the job's end becomes an ExitError with follow's wait code.
+func wait(s *store.Store, j store.Job, until *regexp.Regexp, timeout time.Duration, after int64, asJSON bool) error {
 	ctx, stop := signalCtx()
 	defer stop()
-	lines, code, err := follow.Wait(ctx, s, j, re, c.Timeout, c.After)
+	lines, code, _, err := follow.WaitCursor(ctx, s, j, until, timeout, after)
 	if err != nil {
 		return err
 	}
 	if code != 0 {
-		return store.ExitError{Code: code}
+		return ExitError{Code: code}
 	}
-	return printLines(lines, c.JSON, false)
+	return printLines(lines, asJSON, false)
 }
 
 type notifyCmd struct {
 	Job      string        `arg:"" help:"Job id or name."`
-	Every    time.Duration `default:"30s" help:"Poll interval (min 5s)."`
+	Every    time.Duration `default:"${every}" help:"Poll interval (min 5s)."`
 	Match    string        `help:"Only notify on lines matching this regex." placeholder:"RE"`
-	MaxLines int           `default:"10" help:"Lines per digest."`
+	MaxLines int           `default:"${maxLines}" help:"Lines per digest."`
 	After    int64         `default:"-1" help:"Start cursor (-1 = the job's current end)." placeholder:"ID"`
 	Deliver  string        `xor:"dest" help:"Sink spec, e.g. t3:THREAD." placeholder:"SPEC"`
 	Thread   string        `xor:"dest" help:"T3 thread id (default $T3CODE_THREAD_ID)." placeholder:"ID"`
@@ -618,7 +579,7 @@ func resolveDeliver(deliverFlag, thread string) string {
 		return deliverFlag
 	}
 	if thread == "" {
-		thread = os.Getenv("T3CODE_THREAD_ID")
+		thread = deliver.EnvThread()
 	}
 	if thread == "" {
 		return ""
@@ -643,8 +604,7 @@ func (c *notifyCmd) Run() error {
 		return err
 	}
 	defer s.Close()
-	pid, err := startNotifier(s, j.ID, follow.NotifierOpts{
-		Every: c.Every, Match: c.Match, MaxLines: c.MaxLines, After: c.After, Deliver: spec})
+	pid, err := startNotifier(s, j.ID, follow.NotifierOpts{Every: c.Every, Match: c.Match, MaxLines: c.MaxLines, After: c.After, Deliver: spec})
 	if err != nil {
 		return err
 	}
@@ -687,21 +647,18 @@ func compile(re string) (*regexp.Regexp, error) {
 	return regexp.Compile(re)
 }
 
-func printJSON(v any) error {
-	enc := json.NewEncoder(stdout)
-	enc.SetIndent("", "  ")
-	return enc.Encode(v)
-}
+// printJSON prints v as one line of compact JSON (agents parse it).
+func printJSON(v any) error { return json.NewEncoder(stdout).Encode(v) }
 
 func printLines(lines []store.Line, asJSON, withJob bool) error {
 	if asJSON {
 		if lines == nil {
 			lines = []store.Line{}
 		}
-		return json.NewEncoder(stdout).Encode(lines)
+		return printJSON(lines)
 	}
 	for _, l := range lines {
-		ts := time.UnixMilli(l.TS).Format("15:04:05")
+		ts := store.Clock(l.TS)
 		if withJob {
 			fmt.Fprintf(stdout, "%d %s %s %s\n", l.ID, l.Job, ts, l.Text)
 		} else {
@@ -709,11 +666,4 @@ func printLines(lines []store.Line, asJSON, withJob bool) error {
 		}
 	}
 	return nil
-}
-
-func label(j store.Job) string {
-	if j.Name != "" {
-		return j.ID + " (" + j.Name + ")"
-	}
-	return j.ID
 }

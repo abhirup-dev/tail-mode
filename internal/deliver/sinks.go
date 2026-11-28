@@ -13,8 +13,12 @@ import (
 	"time"
 )
 
+// EnvThread is the caller's T3 thread from $T3CODE_THREAD_ID, trimmed ("" = not in T3). Only the
+// integration layer calls it; sinks and the core never read the environment.
+func EnvThread() string { return strings.TrimSpace(os.Getenv("T3CODE_THREAD_ID")) }
+
 // New builds a sink from a --deliver spec: "stdout" | "jsonl" | "t3:THREAD". The thread is always
-// explicit: resolving it from the environment is the integration layer's job.
+// explicit: resolving it from the environment is the integration layer's job (EnvThread).
 func New(spec string) (Sink, error) {
 	switch {
 	case spec == "" || spec == "stdout":
