@@ -1,12 +1,12 @@
-package mcpserver
+package tools
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -134,7 +134,7 @@ func TestStartOpts(t *testing.T) {
 // Identity comes from the server's env only: no tool takes thread, the env thread is the owner and
 // the destination, and owner is only a fallback label.
 func TestIdentityFromEnv(t *testing.T) {
-	started, notes := stubs(t)
+	last, notes := fakes(t)
 
 	t.Setenv("T3CODE_THREAD_ID", "thread-1")
 	cs := client(t, testStore(t))
@@ -151,39 +151,39 @@ func TestIdentityFromEnv(t *testing.T) {
 	if text := callErr(t, cs, "tail_jobs", map[string]any{"thread": "t9"}); !strings.Contains(text, "thread") {
 		t.Fatalf("thread param accepted: %s", text)
 	}
-	out := call(t, cs, "tail_start", map[string]any{"cmd": "make", "dir": "/abs", "owner": "ignored"})
-	if started.Owner != "thread-1" || !strings.Contains(out, "owner: this T3 thread\n") ||
-		!strings.Contains(out, "notifications: off; tail_notify sends digests → this T3 thread thread-1 (detected from your session; you do not need to pass it)") {
-		t.Fatalf("owner %q:\n%s", started.Owner, out)
-	}
-	out = call(t, cs, "tail_notify", map[string]any{"job": "j000001"})
-	if n := (*notes)[0]; n.Deliver != "t3:thread-1" || !strings.Contains(out, "notifications: on → this T3 thread thread-1 (detected from your session") {
-		t.Fatalf("notify %+v:\n%s", n, out)
-	}
 	if out := call(t, cs, "tail_jobs", map[string]any{}); out != "jobs: 0 jobs for this thread\n"+helpBlock(`tail_start cmd="<command>" dir="<absolute dir>" runs one`, "all=true lists every owner's jobs") {
 		t.Fatalf("jobs empty:\n%s", out)
+	}
+	out := call(t, cs, "tail_start", map[string]any{"cmd": "make", "owner": "ignored"})
+	if cwd, _ := os.Getwd(); last().Owner != "thread-1" || last().Cwd != cwd || !strings.Contains(out, "dir: "+cwd+"\n") || !strings.Contains(out, "owner: this T3 thread\n") ||
+		!strings.Contains(out, "notifications: off; tail_notify sends digests → this T3 thread thread-1 (detected from your session; you do not need to pass it)") {
+		t.Fatalf("owner %q:\n%s", last().Owner, out)
+	}
+	out = call(t, cs, "tail_notify", map[string]any{"job": "j000001"})
+	if n := notes()[0]; n.Deliver != "t3:thread-1" || !strings.Contains(out, "notifications: on → this T3 thread thread-1 (detected from your session") {
+		t.Fatalf("notify %+v:\n%s", n, out)
 	}
 
 	// No thread: owner is the label, notify returns the wake recipe (no error), results say so.
 	t.Setenv("T3CODE_THREAD_ID", "")
 	cs = client(t, testStore(t))
-	out = call(t, cs, "tail_start", map[string]any{"cmd": "make", "dir": "/abs", "owner": "me", "notify_every": "30s"})
-	if started.Owner != "me" || !strings.Contains(out, "no T3 thread detected") || !strings.Contains(out, "tail-mode follow j000009 --every 30s --after 0") ||
-		strings.Contains(out, "warning") || len(*notes) != 1 {
-		t.Fatalf("owner %q:\n%s", started.Owner, out)
+	out = call(t, cs, "tail_start", map[string]any{"cmd": "make", "dir": "/abs", "owner": "me", "notify_match": "ERR x"})
+	if last().Owner != "me" || !strings.Contains(out, "no T3 thread detected") || !strings.Contains(out, " --every 30s --match 'ERR x' --after 0") ||
+		!strings.Contains(out, "tail-mode wait j") || strings.Contains(out, "warning") || len(notes()) != 1 {
+		t.Fatalf("owner %q:\n%s", last().Owner, out)
 	}
 	out = call(t, cs, "tail_notify", map[string]any{"job": "web"})
-	if !strings.Contains(out, "no T3 thread detected so nothing was started") || !strings.Contains(out, "tail_wait job=j000001") || len(*notes) != 1 {
+	if !strings.Contains(out, "no T3 thread detected so nothing was started") || !strings.Contains(out, "tail_wait job=j000001") || len(notes()) != 1 {
 		t.Fatalf("notify without thread:\n%s", out)
 	}
 	out = call(t, cs, "tail_start", map[string]any{"cmd": "make", "dir": "/abs"})
-	if started.Owner != "" || !strings.Contains(out, "owner: none (shared namespace)") || !strings.Contains(out, "warning: no T3 thread detected and no owner given") {
+	if last().Owner != "" || !strings.Contains(out, "owner: none (shared namespace)") || !strings.Contains(out, "warning: no T3 thread detected and no owner given") {
 		t.Fatalf("shared namespace:\n%s", out)
 	}
 }
 
 func TestStartNotifyFromZero(t *testing.T) {
-	started, notes := stubs(t)
+	last, notes := fakes(t)
 	t.Setenv("T3CODE_THREAD_ID", "thread-1")
 	cs := client(t, testStore(t))
 	out := call(t, cs, "tail_start", map[string]any{"file": "/x", "backlog": 5, "notify_every": "10s", "notify_match": "ERR"})
@@ -193,75 +193,27 @@ func TestStartNotifyFromZero(t *testing.T) {
 		t.Fatal(out)
 	}
 	var cfg source.FileConfig
-	if err := json.Unmarshal(started.Spec.Config, &cfg); err != nil || cfg.Path != "/x" || cfg.Backlog == nil || *cfg.Backlog != 5 {
-		t.Fatalf("spec %+v: %v", started.Spec, err)
+	if err := json.Unmarshal(last().Spec.Config, &cfg); err != nil || cfg.Path != "/x" || cfg.Backlog == nil || *cfg.Backlog != 5 {
+		t.Fatalf("spec %+v: %v", last().Spec, err)
 	}
-	if n := (*notes)[0]; len(*notes) != 1 || n.After != 0 || n.Deliver != "t3:thread-1" || n.Match != "ERR" || n.Every.String() != "10s" {
-		t.Fatalf("notifier opts %+v", *notes)
+	if n := notes()[0]; len(notes()) != 1 || n.After != 0 || n.Deliver != "t3:thread-1" || n.Match != "ERR" || n.Every.String() != "10s" {
+		t.Fatalf("notifier opts %+v", notes())
 	}
 	// tail_notify on an existing job starts from now unless after is given.
 	call(t, cs, "tail_notify", map[string]any{"job": "j000001"})
 	call(t, cs, "tail_notify", map[string]any{"job": "j000001", "after": 2})
-	if n := (*notes)[1]; n.After != -1 || n.Deliver != "t3:thread-1" {
+	if n := notes()[1]; n.After != -1 || n.Deliver != "t3:thread-1" {
 		t.Fatalf("notify opts %+v", n)
 	}
-	if n := (*notes)[2]; n.After != 2 {
+	if n := notes()[2]; n.After != 2 {
 		t.Fatalf("notify opts %+v", n)
 	}
 }
 
 func TestStartBadNotifyStartsNothing(t *testing.T) {
-	started, _ := stubs(t)
-	if _, err := (&server{}).start(context.Background(), StartIn{Cmd: "x", Dir: "/x", NotifyMatch: "("}); err == nil || started.Spec.Kind != "" {
-		t.Fatalf("err %v, started %+v", err, *started)
-	}
-}
-
-func TestNotifyRecipe(t *testing.T) {
-	_, notes := stubs(t)
-	out, err := (&server{}).start(context.Background(), StartIn{Cmd: "x", Dir: "/x", NotifyEvery: "30s", NotifyMatch: "ERR x"})
-	if err != nil || !strings.Contains(out, "tail-mode follow j000009 --every 30s --match 'ERR x' --after 0") ||
-		!strings.Contains(out, "tail-mode wait j000009 --until RE --timeout 30m --after 0") || len(*notes) != 0 {
-		t.Fatalf("%v\n%s", err, out)
-	}
-}
-
-func TestStartCmdOptionsAndLocalDefaults(t *testing.T) {
-	started, _ := stubs(t)
-	cs := client(t, testStore(t))
-	call(t, cs, "tail_start", map[string]any{"cmd": "npm run dev", "env": map[string]any{"PORT": "3000"}, "shell": "zsh", "login": true})
-	var c source.CmdConfig
-	if err := json.Unmarshal(started.Spec.Config, &c); err != nil {
-		t.Fatal(err)
-	}
-	cwd, _ := os.Getwd()
-	if c.Cmd != "npm run dev" || c.Dir != cwd || c.Env["PORT"] != "3000" || c.Shell != "zsh" || !c.Login {
-		t.Fatalf("local cmd config %+v", c)
-	}
-	// Remote: an empty dir stays empty (remote home), and paths are not touched.
-	out := call(t, cs, "tail_start", map[string]any{"cmd": "make", "host": "vps"})
-	if string(started.Spec.Config) != `{"cmd":"make"}` || started.Target != "vps" || !strings.Contains(out, "on: ssh vps") || !strings.Contains(out, "dir: ~ (remote home)") {
-		t.Fatalf("remote spec %s\n%s", started.Spec.Config, out)
-	}
-	call(t, cs, "tail_start", map[string]any{"file": "logs/app.log"})
-	if string(started.Spec.Config) != `{"path":"`+filepath.Join(cwd, "logs/app.log")+`"}` {
-		t.Fatalf("local file spec %s", started.Spec.Config)
-	}
-	call(t, cs, "tail_start", map[string]any{"source": "cmd", "config": map[string]any{"cmd": "x"}})
-	if string(started.Spec.Config) != `{"cmd":"x","dir":`+strconv.Quote(cwd)+`}` {
-		t.Fatalf("generic cmd spec %s", started.Spec.Config)
-	}
-	for _, in := range []StartIn{
-		{File: "a", Dir: "/x"},
-		{File: "a", Login: true},
-		{Source: "cmd", Config: map[string]any{"cmd": "x"}, Env: map[string]string{"A": "1"}},
-	} {
-		if _, err := startOpts(in); err == nil {
-			t.Errorf("want error for %+v", in)
-		}
-	}
-	if _, err := (&server{}).start(context.Background(), StartIn{Cmd: "x", Env: map[string]string{"1A": "v"}}); err == nil {
-		t.Error("invalid env name accepted")
+	last, _ := fakes(t)
+	if _, err := (&handler{}).start(context.Background(), StartIn{Cmd: "x", Dir: "/x", NotifyMatch: "("}); err == nil || last().Spec.Kind != "" {
+		t.Fatalf("err %v, started %+v", err, last())
 	}
 }
 
@@ -409,7 +361,7 @@ func TestDescriptions(t *testing.T) {
 
 // tail_start takes host only (no transport/target, on any tool); host alone runs the job over ssh.
 func TestStartHostOnly(t *testing.T) {
-	started, _ := stubs(t)
+	last, _ := fakes(t)
 	cs := client(t, testStore(t))
 	res, err := cs.ListTools(context.Background(), nil)
 	if err != nil {
@@ -435,10 +387,12 @@ func TestStartHostOnly(t *testing.T) {
 		}
 	}
 	out := call(t, cs, "tail_start", map[string]any{"cmd": "./build.sh", "host": "vps", "dir": "/srv/app", "owner": "me"})
-	var cfg source.CmdConfig
-	if err := json.Unmarshal(started.Spec.Config, &cfg); err != nil || started.Transport != "ssh" || started.Target != "vps" ||
-		cfg.Dir != "/srv/app" || !strings.Contains(out, "on: ssh vps") {
-		t.Fatalf("%+v %v\n%s", *started, err, out)
+	if o := last(); o.Transport != "ssh" || o.Target != "vps" || !strings.Contains(out, "on: ssh vps\n  dir: /srv/app\n") {
+		t.Fatalf("%+v\n%s", o, out)
+	}
+	// Remote: an empty dir stays empty (the remote home).
+	if out := call(t, cs, "tail_start", map[string]any{"cmd": "make", "host": "vps"}); !strings.Contains(out, "dir: ~ (remote home)") {
+		t.Fatalf("remote home:\n%s", out)
 	}
 	if text := callErr(t, cs, "tail_start", map[string]any{"cmd": "x", "host": "vps", "transport": "ssh"}); !strings.Contains(text, "transport") {
 		t.Fatalf("transport accepted: %s", text)
@@ -447,7 +401,7 @@ func TestStartHostOnly(t *testing.T) {
 
 // With a T3 thread, a notify-on result tells the agent to end its turn and never suggests tail_wait.
 func TestNotifyOnSaysEndTurn(t *testing.T) {
-	stubs(t)
+	fakes(t)
 	t.Setenv("T3CODE_THREAD_ID", "thread-1")
 	cs := client(t, testStore(t))
 	for _, c := range []struct {
@@ -479,5 +433,62 @@ func TestStopForceWording(t *testing.T) {
 	text := callErr(t, cs, "tail_stop", map[string]any{"job": "j0000ab", "owner": "b"})
 	if !strings.Contains(text, "force: true") || strings.Contains(text, "--force") || strings.Contains(text, "CLI") {
 		t.Fatalf("stop without force: %s", text)
+	}
+}
+
+// `tail-mode tool` and MCP are one implementation: List is what MCP advertises, and Exec returns the
+// MCP text (ids and ages normalized).
+func TestListAndExecMatchMCP(t *testing.T) {
+	fakes(t)
+	s := testStore(t)
+	cs := client(t, s)
+	res, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canon := func(v any) string { // through any, so key order does not matter
+		var x any
+		b, _ := json.Marshal(v)
+		_ = json.Unmarshal(b, &x)
+		b, _ = json.Marshal(x)
+		return string(b)
+	}
+	if got, want := canon(List()), canon(res.Tools); got != want {
+		t.Fatalf("list:\n%s\nmcp:\n%s", got, want)
+	}
+	norm := regexp.MustCompile(`j[0-9a-f]{6}|\d+s ago`)
+	h := &handler{s: testStore(t)} // its own store, so each side starts and stops its own job
+	for _, c := range []struct {
+		tool string
+		args map[string]any
+	}{
+		{"tail_start", map[string]any{"cmd": "make", "dir": "/abs", "name": "b"}},
+		{"tail_read", map[string]any{"job": "web"}},
+		{"tail_jobs", map[string]any{}},
+		{"tail_stop", map[string]any{"job": "b"}},
+		{"tail_read", map[string]any{"job": "nope"}},
+	} {
+		mcpText, isErr, err := callResult(cs, c.tool, c.args)
+		args, _ := json.Marshal(c.args)
+		r, xerr := h.exec(context.Background(), c.tool, args)
+		cliText := r.Text
+		if xerr != nil {
+			cliText = xerr.Error()
+		}
+		if err != nil || isErr != (xerr != nil) || norm.ReplaceAllString(mcpText, "X") != norm.ReplaceAllString(cliText, "X") {
+			t.Errorf("%s %v: mcp (error %v):\n%s\nexec (error %v):\n%s", c.tool, c.args, isErr, mcpText, xerr, cliText)
+		}
+	}
+}
+
+// A client that delivers digests itself (Pi) gets the follower to run, not a T3 notifier or the recipe.
+func TestPiNotify(t *testing.T) {
+	_, notes := fakes(t)
+	h := &handler{s: testStore(t), pi: true}
+	r, err := h.exec(context.Background(), "tail_notify", []byte(`{"job":"web","match":"ERR"}`))
+	want := []string{"follow", "--deliver=jsonl", "--after=-1", "--every=30s", "--max-lines=10", "--match=ERR", "--", "j000001"}
+	if err != nil || r.Follow == nil || r.Follow.Job != "j000001" || !slices.Equal(r.Follow.Argv, want) || len(notes()) != 0 ||
+		!strings.Contains(r.Text, "notifications: on → this Pi session") || !strings.Contains(r.Text, "End your turn") {
+		t.Fatalf("%v %+v\n%s", err, r.Follow, r.Text)
 	}
 }

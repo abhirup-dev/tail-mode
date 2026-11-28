@@ -67,12 +67,12 @@ func TestRunCommandJoin(t *testing.T) {
 
 // fakeRun replaces the job/notifier seams: the fake job is created in the store with lines, and finished
 // when ended is true. It returns the captured StartOpts and notifier calls.
-func fakeRun(t *testing.T, lines []string, ended bool) (*jobs.StartOpts, *[]follow.NotifierOpts, *bytes.Buffer) {
+func fakeRun(t *testing.T, lines []string, ended bool) (*jobs.StartOpts, *[]follow.Options, *bytes.Buffer) {
 	t.Helper()
 	t.Setenv("TAIL_MODE_HOME", t.TempDir())
 	t.Setenv("T3CODE_THREAD_ID", "")
 	var got jobs.StartOpts
-	var notifiers []follow.NotifierOpts
+	var notifiers []follow.Options
 	oldJob, oldNotifier := startJob, startNotifier
 	startJob = func(s *store.Store, o jobs.StartOpts) (store.Job, error) {
 		got = o
@@ -93,7 +93,7 @@ func fakeRun(t *testing.T, lines []string, ended bool) (*jobs.StartOpts, *[]foll
 		}
 		return s.GetJob(j.ID, "")
 	}
-	startNotifier = func(_ *store.Store, job string, o follow.NotifierOpts) (int, error) {
+	startNotifier = func(_ *store.Store, job string, o follow.Options) (int, error) {
 		notifiers = append(notifiers, o)
 		return 4242, nil
 	}
@@ -111,7 +111,7 @@ func TestRunLocalDefaultsAndRecipe(t *testing.T) {
 	var c source.CmdConfig
 	json.Unmarshal(o.Spec.Config, &c)
 	cwd, _ := os.Getwd()
-	if o.Spec.Kind != "cmd" || o.Transport != "" || c.Cmd != "npm run dev" || c.Dir != cwd || c.Env["A"] != "1" || o.Name != "dev" {
+	if o.Spec.Kind != "cmd" || o.Transport != "" || c.Cmd != "npm run dev" || o.Cwd != cwd || c.Env["A"] != "1" || o.Name != "dev" {
 		t.Fatalf("opts %+v config %+v", o, c)
 	}
 	lines := strings.Split(out.String(), "\n")
@@ -167,7 +167,6 @@ func TestRunErrors(t *testing.T) {
 		{"run", "--match", "(", "--", "x"},
 		{"run", "--until", "(", "--", "x"},
 		{"run", "--thread", "T1", "--", "x"}, // a destination without --every/--match
-		{"run", "--env", "1A=x", "--", "x"},
 	} {
 		if err := Run(args); err == nil {
 			t.Errorf("%q: want error", args)

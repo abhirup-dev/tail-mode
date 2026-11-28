@@ -1,7 +1,9 @@
-package mcpserver
+package tools
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"os"
 	"sync"
 	"testing"
@@ -38,13 +40,13 @@ func testStore(t *testing.T, lines ...string) *store.Store {
 	return s
 }
 
-// connect connects an MCP client to newServer(s, shared) over in-memory transports. The server reads
+// connect connects an MCP client to a server over in-memory transports. The handler reads
 // T3CODE_THREAD_ID when it is created, so set it before.
 func connect(t *testing.T, s *store.Store, shared bool) *mcp.ClientSession {
 	t.Helper()
 	ctx := context.Background()
 	ct, st := mcp.NewInMemoryTransports()
-	ss, err := newServer(s, shared).Connect(ctx, st, nil)
+	ss, err := newServer(&handler{s: s, shared: shared, thread: EnvThread()}).Connect(ctx, st, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,36 +94,31 @@ func callErr(t *testing.T, cs *mcp.ClientSession, tool string, args map[string]a
 	return text
 }
 
-// stubs replaces the job/notifier seams: startJob returns a fixed job, notifier starts are recorded.
-func stubs(t *testing.T) (*jobs.StartOpts, *[]follow.NotifierOpts) {
-	var started jobs.StartOpts
-	var notes []follow.NotifierOpts
-	oldJob, oldNote := startJob, startNotifier
-	t.Cleanup(func() { startJob, startNotifier = oldJob, oldNote })
-	startJob = func(_ *store.Store, o jobs.StartOpts) (store.Job, error) {
-		started = o
-		return store.Job{ID: "j000009", Describe: "tail -F /x", Status: "running"}, nil
-	}
-	startNotifier = func(_ *store.Store, job string, o follow.NotifierOpts) (int, error) {
-		if job != "j000009" && job != "j000001" {
-			t.Errorf("notifier for %q", job)
-		}
-		notes = append(notes, o)
-		return 4242, nil
-	}
-	return &started, &notes
-}
-
-// rowStubs makes startJob insert a real "starting" row (no process; Stop aborts it) with one line,
-// and records notifier starts. Both are safe for concurrent use.
-func rowStubs(t *testing.T) (notes func() []follow.NotifierOpts) {
+// fakes replaces the job/notifier seams. startJob resolves like jobs.Start and inserts a "starting" row
+// (no process; Stop aborts it) with ids j000009, j00000a, … and one marker line; notifier starts are
+// recorded. last is the latest StartOpts as passed in. Both are safe for concurrent use.
+func fakes(t *testing.T) (last func() jobs.StartOpts, notes func() []follow.Options) {
 	var mu sync.Mutex
-	var ns []follow.NotifierOpts
+	var started jobs.StartOpts
+	var ns []follow.Options
+	n := 8
 	oldJob, oldNote := startJob, startNotifier
 	t.Cleanup(func() { startJob, startNotifier = oldJob, oldNote })
 	startJob = func(s *store.Store, o jobs.StartOpts) (store.Job, error) {
-		j := store.Job{ID: store.NewJobID(), Name: o.Name, Owner: o.Owner, Kind: o.Spec.Kind, Transport: "local",
-			Spec: string(o.Spec.Config), Describe: "stub", Status: "starting", StartedAt: store.NowMS()}
+		mu.Lock()
+		started, n = o, n+1
+		id := fmt.Sprintf("j%06x", n)
+		mu.Unlock()
+		o, err := o.Resolve()
+		if err != nil {
+			return store.Job{}, err
+		}
+		spec, _ := json.Marshal(o.Spec)
+		j := store.Job{ID: id, Name: o.Name, Owner: o.Owner, Kind: o.Spec.Kind, Transport: "local", Target: o.Target,
+			Spec: string(spec), Describe: "stub", Status: "starting", StartedAt: store.NowMS()}
+		if o.Target != "" {
+			j.Transport = o.Transport
+		}
 		if err := s.CreateJob(j); err != nil {
 			return j, err
 		}
@@ -130,15 +127,12 @@ func rowStubs(t *testing.T) (notes func() []follow.NotifierOpts) {
 		}
 		return s.GetJob(j.ID, "")
 	}
-	startNotifier = func(_ *store.Store, _ string, o follow.NotifierOpts) (int, error) {
+	startNotifier = func(_ *store.Store, _ string, o follow.Options) (int, error) {
 		mu.Lock()
 		defer mu.Unlock()
 		ns = append(ns, o)
 		return 4242, nil
 	}
-	return func() []follow.NotifierOpts {
-		mu.Lock()
-		defer mu.Unlock()
-		return append([]follow.NotifierOpts(nil), ns...)
-	}
+	return func() jobs.StartOpts { mu.Lock(); defer mu.Unlock(); return started },
+		func() []follow.Options { mu.Lock(); defer mu.Unlock(); return append([]follow.Options(nil), ns...) }
 }

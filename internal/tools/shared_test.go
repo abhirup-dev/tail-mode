@@ -1,4 +1,4 @@
-package mcpserver
+package tools
 
 import (
 	"fmt"
@@ -15,7 +15,7 @@ var startedRe = regexp.MustCompile(`^started:\n  job: (j[0-9a-f]+)\n`)
 // Many non-T3 agents over ONE MCP session, each identified by its owner label: interleaved start,
 // read, search, jobs and stop with the same job name, concurrently. No errors, no cross-talk.
 func TestSharedSessionConcurrentOwners(t *testing.T) {
-	rowStubs(t)
+	fakes(t)
 	s, err := store.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -96,7 +96,7 @@ func TestSharedSessionConcurrentOwners(t *testing.T) {
 // Shared mode: no fallback to the server's cwd; errors say exactly what to pass. The env thread is
 // still the caller's (one server process per agent session).
 func TestSharedModeValidation(t *testing.T) {
-	notes := rowStubs(t)
+	_, notes := fakes(t)
 	t.Setenv("T3CODE_THREAD_ID", "env-thread")
 	s, err := store.Open(t.TempDir())
 	if err != nil {

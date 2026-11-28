@@ -95,7 +95,7 @@ func TestFollowMatchAndFinal(t *testing.T) {
 	sink := &fakeSink{}
 	done := make(chan error, 1)
 	go func() {
-		done <- Follow(context.Background(), s, j, Options{Match: regexp.MustCompile("ERR"), MaxLines: 2, After: -1}, sink)
+		done <- Follow(context.Background(), s, j, Options{Every: minEvery, Match: "ERR", MaxLines: 2, After: -1}, sink)
 	}()
 	time.Sleep(50 * time.Millisecond)
 	s.Append(j.ID, []string{"ok", "ERR a", "ERR b", "ERR " + strings.Repeat("x", 400)}, store.NowMS())
@@ -125,7 +125,7 @@ func TestFollowMatchAndFinal(t *testing.T) {
 	if f.LastLine == nil || f.LastLine.Text != "no match" || f.LastMatched || f.Total != 6 {
 		t.Fatalf("final summary %+v %+v", f, f.LastLine)
 	}
-	if got := deliver.PushText(f); !strings.HasPrefix(got, "[tail-mode] web FINISHED · exited 3 · 6 lines · last (not matching /ERR/): no match\n") {
+	if got := deliver.Text(f); !strings.HasPrefix(got, "[tail-mode] web FINISHED · exited 3 · 6 lines · last (not matching /ERR/): no match\n") {
 		t.Fatalf("final digest header: %s", got)
 	}
 }
@@ -135,7 +135,7 @@ func TestFollowCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	sink := &fakeSink{}
-	go func() { done <- Follow(ctx, s, j, Options{After: -1}, sink) }()
+	go func() { done <- Follow(ctx, s, j, Options{Every: minEvery, After: -1}, sink) }()
 	time.Sleep(50 * time.Millisecond)
 	cancel()
 	if err := <-done; err != context.Canceled {
@@ -176,7 +176,7 @@ func TestFollowNonFinalFailureKeepsNews(t *testing.T) {
 	s, j := setup(t, true)
 	sink := &fakeSink{fail: func(d deliver.Digest, try int) bool { return try == 1 }}
 	done := make(chan error, 1)
-	go func() { done <- Follow(context.Background(), s, j, Options{After: 0}, sink) }()
+	go func() { done <- Follow(context.Background(), s, j, Options{Every: minEvery, After: 0}, sink) }()
 	s.Append(j.ID, []string{"a", "b"}, store.NowMS())
 	waitFor(t, func() bool { sink.mu.Lock(); defer sink.mu.Unlock(); return sink.tries >= 1 })
 	s.Append(j.ID, []string{"c"}, store.NowMS())
@@ -195,7 +195,7 @@ func TestFollowFinalDigestRetried(t *testing.T) {
 	s, j := setup(t, true)
 	s.Finish(j.ID, "exited", 0, "", false)
 	sink := &fakeSink{fail: func(d deliver.Digest, try int) bool { return try <= 2 }} // flaky: 2 failures
-	if err := Follow(context.Background(), s, j, Options{After: 0}, sink); err != nil {
+	if err := Follow(context.Background(), s, j, Options{Every: minEvery, After: 0}, sink); err != nil {
 		t.Fatal(err)
 	}
 	if ds := sink.get(); len(ds) != 1 || !ds[0].Final || sink.tries != 3 {
@@ -203,7 +203,7 @@ func TestFollowFinalDigestRetried(t *testing.T) {
 	}
 
 	sink = &fakeSink{fail: func(deliver.Digest, int) bool { return true }}
-	err := Follow(context.Background(), s, j, Options{After: 0}, sink)
+	err := Follow(context.Background(), s, j, Options{Every: minEvery, After: 0}, sink)
 	if err == nil || !strings.Contains(err.Error(), "sink down") || sink.tries != 4 {
 		t.Fatalf("want error after 1+3 tries, got %v after %d", err, sink.tries)
 	}
@@ -212,7 +212,7 @@ func TestFollowFinalDigestRetried(t *testing.T) {
 func TestFollowLostEnds(t *testing.T) {
 	s, j := setup(t, false)
 	sink := &fakeSink{}
-	if err := Follow(context.Background(), s, j, Options{After: 0}, sink); err != nil {
+	if err := Follow(context.Background(), s, j, Options{Every: minEvery, After: 0}, sink); err != nil {
 		t.Fatal(err)
 	}
 	if ds := sink.get(); len(ds) != 1 || !ds[0].Final || ds[0].Status != "lost" {

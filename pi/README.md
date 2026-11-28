@@ -1,21 +1,22 @@
 # tail-mode for Pi
 
-Pi extension exposing `tail_start`, `tail_wait`, `tail_stop`, `tail_jobs`, `tail_read`, `tail_search`, `tail_sql`, `tail_notify`.
-Each tool shells out to `tail-mode … --json`. Notifiers (`tail_notify`, or `tail_start` with `notify_every`) run
-`tail-mode follow <job> --deliver jsonl` as a child of Pi and wake the session with a digest message
-(`customType: "tail-mode-digest"`). They stop when the job ends or the Pi session shuts down; the jobs themselves keep running.
-Every tool takes an optional `owner` (passed as `--owner`; unset, the CLI defaults to `$T3CODE_THREAD_ID`): job names
-resolve among that owner's jobs. `tail_jobs`/`tail_search` take `all`, `tail_stop` takes `force`.
+A shim over the Go tools: at load it registers what `tail-mode tool --list` prints (the MCP tool set:
+names, descriptions, schemas) and runs each call as `tail-mode tool <name> - --client=pi`, so results,
+errors and identity (`$T3CODE_THREAD_ID`, else the `owner` param) match MCP. When a result turns
+notifications on, it runs the `tail-mode follow … --deliver jsonl` the result names, as a child of Pi, and
+wakes the session with each digest (`customType: "tail-mode-digest"`). A follower stops after the final
+digest, when replaced for the same job, or at session shutdown; the jobs keep running.
 
 ## Install
 
-Requires `tail-mode` on `PATH`, or `TAIL_MODE_BIN=/path/to/tail-mode`.
+Requires a `tail-mode` build that has `tail-mode tool` (this repo, after the tools unification) on `PATH`,
+or `TAIL_MODE_BIN=/path/to/tail-mode`; with an older binary the extension fails to load.
 
 ```sh
 ln -s "$PWD/pi/tail-mode.ts" ~/.pi/agent/extensions/tail-mode.ts   # or cp
 ```
 
-Try without installing: `pi -e ./pi/tail-mode.ts`.
+Try without installing: `go build -o /tmp/tail-mode . && TAIL_MODE_BIN=/tmp/tail-mode pi -e ./pi/tail-mode.ts`.
 
 ## Develop
 

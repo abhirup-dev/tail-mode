@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"time"
 
@@ -27,13 +28,6 @@ const (
 	WaitTimeout     = 3 // WaitCursor codes (and CLI exit codes); a match is 0
 	WaitEnded       = 4
 )
-
-type Options struct {
-	Every    time.Duration  // callers validate it (NotifierOpts.Validate); Follow floors it at 5s
-	Match    *regexp.Regexp // nil = all lines
-	MaxLines int            // default DefaultMaxLines
-	After    int64          // -1 = job's current max id
-}
 
 // Test knobs.
 var (
@@ -77,12 +71,14 @@ func startCursor(s *store.Store, job string, after int64) (int64, error) {
 // Follow polls job every o.Every and delivers a digest per tick with news; on job end it delivers a
 // final digest (retried, see finalRetry) and returns nil. Returns ctx.Err() on cancel. A failed
 // non-final delivery keeps the accumulated news for the next tick.
+// o is validated first (Validate); o.Deliver is ignored (the caller built sink).
 func Follow(ctx context.Context, s *store.Store, job store.Job, o Options, sink deliver.Sink) error {
-	if o.Every < minEvery {
-		o.Every = minEvery
+	if err := o.Validate(); err != nil {
+		return err
 	}
-	if o.MaxLines <= 0 {
-		o.MaxLines = DefaultMaxLines
+	var match *regexp.Regexp
+	if o.Match != "" {
+		match = regexp.MustCompile(o.Match)
 	}
 	cursor, err := startCursor(s, job.ID, o.After)
 	if err != nil {
@@ -117,8 +113,8 @@ func Follow(ctx context.Context, s *store.Store, job store.Job, o Options, sink 
 				}
 				cursor = l.ID
 				newN++
-				if o.Match != nil {
-					if !o.Match.MatchString(l.Text) {
+				if match != nil {
+					if !match.MatchString(l.Text) {
 						continue
 					}
 					matched++
@@ -129,19 +125,16 @@ func Follow(ctx context.Context, s *store.Store, job store.Job, o Options, sink 
 				}
 			}
 		}
-		if newN > 0 && (o.Match == nil || matched > 0) || !running {
+		if newN > 0 && (match == nil || matched > 0) || !running {
 			d := deliver.Digest{Job: job.ID, Name: job.Name, Host: job.Target, Status: job.Status,
-				New: newN, Matched: matched, From: from, To: cursor, Final: !running, Lines: keep}
-			if o.Match != nil {
-				d.Match = o.Match.String()
-			}
+				New: newN, Matched: matched, From: from, To: cursor, Final: !running, Lines: keep, Match: o.Match}
 			if !running {
 				if job.Status == "exited" {
 					code := job.ExitCode
 					d.ExitCode = &code
 				}
 				d.Error = job.Error
-				finalSummary(s, job, o.Match, &d)
+				finalSummary(s, job, match, &d)
 				return deliverFinal(ctx, sink, d)
 			}
 			if err := sink.Deliver(ctx, d); err != nil {
@@ -243,9 +236,9 @@ func WaitCursor(ctx context.Context, s *store.Store, job store.Job, until *regex
 	}
 }
 
-// NotifierOpts configure a detached follower. Zero Every/MaxLines mean the defaults; After 0 means from
-// the job's first line, -1 its current end. Deliver is a deliver.New spec, required by StartNotifier.
-type NotifierOpts struct {
+// Options configure a follower. Zero Every/MaxLines mean the defaults; After 0 means from the job's
+// first line, -1 its current end. Deliver is a deliver.New spec, required by StartNotifier.
+type Options struct {
 	Every    time.Duration
 	Match    string
 	MaxLines int
@@ -254,8 +247,8 @@ type NotifierOpts struct {
 }
 
 // Validate fills in the defaults (so callers report effective values), then rejects an interval below
-// 5s (Follow would raise it silently), a negative MaxLines and a bad Match regex.
-func (o *NotifierOpts) Validate() error {
+// 5s, a negative MaxLines and a bad Match regex. It is the only check of these rules.
+func (o *Options) Validate() error {
 	if o.Every == 0 {
 		o.Every = DefaultEvery
 	}
@@ -319,7 +312,7 @@ func stopNotifier(s *store.Store, job, deliver string) error {
 // StartNotifier makes a detached `tail-mode follow` process the one notifier for (job, o.Deliver):
 // a live follower for the same job and destination is stopped first (followers for other
 // destinations are left alone). It returns once the new follower has registered, with its pid.
-func StartNotifier(s *store.Store, job string, o NotifierOpts) (int, error) {
+func StartNotifier(s *store.Store, job string, o Options) (int, error) {
 	if o.Deliver == "" {
 		return 0, errors.New("notifier: no deliver spec")
 	}
@@ -332,12 +325,7 @@ func StartNotifier(s *store.Store, job string, o NotifierOpts) (int, error) {
 	if err := stopNotifier(s, job, o.Deliver); err != nil {
 		return 0, err
 	}
-	args := []string{"follow", "--notifier", "--deliver=" + o.Deliver, "--after=" + strconv.FormatInt(o.After, 10),
-		"--every=" + o.Every.String(), "--max-lines=" + strconv.Itoa(o.MaxLines)}
-	if o.Match != "" {
-		args = append(args, "--match="+o.Match)
-	}
-	pid, err := proc.Detach(s.Dir, append(args, "--", job)...)
+	pid, err := proc.Detach(s.Dir, slices.Insert(o.FollowArgs(job), 1, "--notifier")...)
 	if err != nil {
 		return 0, err
 	}
@@ -354,4 +342,14 @@ func StartNotifier(s *store.Store, job string, o NotifierOpts) (int, error) {
 				pid, job, o.Deliver, filepath.Join(s.Dir, "proc.log"))
 		}
 	}
+}
+
+// FollowArgs is the `tail-mode follow` argv (without the program) for job with validated o.
+func (o Options) FollowArgs(job string) []string {
+	args := []string{"follow", "--deliver=" + o.Deliver, "--after=" + strconv.FormatInt(o.After, 10),
+		"--every=" + o.Every.String(), "--max-lines=" + strconv.Itoa(o.MaxLines)}
+	if o.Match != "" {
+		args = append(args, "--match="+o.Match)
+	}
+	return append(args, "--", job)
 }

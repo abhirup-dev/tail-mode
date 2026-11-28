@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -173,9 +174,9 @@ func TestStopForceWording(t *testing.T) {
 	}
 }
 
-// --owner defaults to $T3CODE_THREAD_ID (parse only: nothing runs), and --owner= selects the shared namespace.
+// --owner defaults to the trimmed $T3CODE_THREAD_ID (parse only: nothing runs), and --owner= selects the shared namespace.
 func TestOwnerFlag(t *testing.T) {
-	t.Setenv("T3CODE_THREAD_ID", "t-env")
+	t.Setenv("T3CODE_THREAD_ID", " t-env\n")
 	if r := mustParse(t, "read", "web"); r.Read.Owner != "t-env" {
 		t.Fatalf("default owner %q", r.Read.Owner)
 	}
@@ -219,5 +220,22 @@ func TestJobsTable(t *testing.T) {
 	got := buf.String()
 	if strings.Count(got, "\n") != 3 || !strings.Contains(got, "exited 3") || !strings.Contains(got, "failed: boom") || !strings.Contains(got, "echo one ⏎ echo two") {
 		t.Fatalf("jobs:\n%s", got)
+	}
+}
+
+// tool prints the MCP result: the text, the error text with exit 1, or {text, follow?} JSON for Pi.
+func TestTool(t *testing.T) {
+	t.Setenv("TAIL_MODE_HOME", t.TempDir())
+	var buf bytes.Buffer
+	stdout = &buf
+	t.Cleanup(func() { stdout = os.Stdout })
+	var ee ExitError
+	if err := Run([]string{"tool", "tail_read", `{"job":"nope"}`}); !errors.As(err, &ee) || ee.Code != 1 ||
+		!strings.HasPrefix(buf.String(), `error: no job "nope"`) || !strings.Contains(buf.String(), "\nhelp: ") {
+		t.Fatalf("%v %q", err, buf.String())
+	}
+	buf.Reset()
+	if err := Run([]string{"tool", "tail_jobs", "--client", "pi"}); err != nil || !strings.HasPrefix(buf.String(), `{"text":"jobs: 0 jobs for`) {
+		t.Fatalf("%v %q", err, buf.String())
 	}
 }

@@ -76,13 +76,14 @@ Pitfalls:
 |---|---|---|
 | Run a command | `tail_start {cmd, dir, env?, shell?, login?, host?, name?, notify_every?, notify_match?}` | `tail-mode run [--name N] [--host H] [--dir D] [--env K=V]… [--shell S] [--login] [--every 30s] [--match RE] [--until RE] -- CMD…` |
 | Start | `tail_start {file\|cmd\|source+config, host?, name?, backlog?, restart?}` | `tail-mode start --file PATH [--backlog N]` / `--cmd 'CMD' [--dir D] [--env K=V]… [--shell S] [--login]` / `--source KIND --config JSON`, plus `[--host H \| --transport T --target X] [--name N] [--restart\|--no-restart]` |
-| Block until ready (short waits) | `tail_wait {job, until, timeout? (50s; MCP max 5m, Pi no cap), after? (0)}` | `tail-mode wait <job> --until RE [--timeout 30m] [--after 0]` |
+| Block until ready (short waits) | `tail_wait {job, until, timeout? (50s, max 5m), after? (0)}` | `tail-mode wait <job> --until RE [--timeout 30m] [--after 0]` |
 | New lines | `tail_read {job, after: <cursor>}` | `tail-mode read <job> --after ID [--grep RE] [--tail N]` |
 | Search | `tail_search {query, job?, since: "1h"}` | `tail-mode search 'q' [--job J] [--since 1h]` |
 | SQL | `tail_sql {query}` over `jobs`, `lines(id,job,ts,text)` (one SELECT, 5 s) | `tail-mode sql 'select …'` |
 | List / stop | `tail_jobs {all?}`, `tail_stop {job, force?}` | `tail-mode jobs [--all]`, `tail-mode stop <job> [--force]` |
 
-Every MCP tool takes an optional `owner` (outside T3 only; `tail_sql` ignores it); the CLI takes `--owner O`
+MCP and Pi share one tool implementation, so params, results and errors are identical. Every tool takes
+an optional `owner` (outside T3 only; `tail_sql` ignores it); the CLI takes `--owner O`
 (default `$T3CODE_THREAD_ID`) and `notify --thread ID` for humans and scripts. `tail_sql` is not
 scoped: filter with `jobs.owner` (`tail_jobs` shows yours).
 
@@ -130,8 +131,8 @@ scoped: filter with `jobs.owner` (`tail_jobs` shows yours).
   on `tail-mode follow <job> --every 30s [--match RE] [--after 0]` (each digest is one event), or run in
   the background `tail-mode wait <job> --until RE --timeout 30m [--after 0]` (exit 0 on match, 3
   timeout, 4 job ended). `tail_start`/`tail_notify` return this recipe when no T3 thread is detected.
-- **Pi**: the extension handles `notify_every` / `tail_notify` itself; digests arrive as follow-up turns.
-  A notifier that fails to start is reported as an error, not as "notifying".
+- **Pi**: as in T3 (`notify_every`/`notify_match` or `tail_notify`, then end your turn); digests arrive in
+  this session as follow-up turns, until the job ends or the session closes.
 
 The jsonl digest (`follow --deliver jsonl`) has `final` (true on the last digest) and, on the final
 digest, `exit_code` (exited jobs), `error` (failed jobs), `total_lines`, `last_line` (`{id, ts, text}`,

@@ -67,7 +67,7 @@ func TestNotifierReplacement(t *testing.T) {
 	})
 	start := func(deliver string) int {
 		t.Helper()
-		pid, err := follow.StartNotifier(s, j.ID, follow.NotifierOpts{Every: time.Minute, After: 0, Deliver: deliver})
+		pid, err := follow.StartNotifier(s, j.ID, follow.Options{Every: time.Minute, After: 0, Deliver: deliver})
 		if err != nil {
 			t.Fatalf("notifier %s: %v", deliver, err)
 		}

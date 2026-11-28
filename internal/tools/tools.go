@@ -1,6 +1,7 @@
-// Package mcpserver exposes tail-mode as a stdio MCP server. Tools call the core packages directly.
+// Package tools is the one implementation of the tail_* agent tools: names, descriptions, input schemas
+// and handlers. MCP (Serve) and `tail-mode tool` (the Pi extension) both run them.
 //
-// Identity comes from the server's own env, never from tool params: each agent session gets its own
+// Identity comes from the process env, never from tool params: each agent session gets its own
 // `tail-mode mcp` process (MCPorter's stdio bridge spawns one per distinct caller env), so
 // $T3CODE_THREAD_ID is the caller's T3 thread. It owns the caller's jobs and receives its digests.
 // Agents never pass a thread id (weak models copy the wrong one). Clients outside T3 may pass owner.
@@ -10,7 +11,7 @@
 //
 // MCP clients may drop server instructions, resources and prompts, so all guidance lives in tool
 // descriptions and tool results. Results are compact TOON (toonformat.dev) with contextual help.
-package mcpserver
+package tools
 
 import (
 	"context"
@@ -19,13 +20,15 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
+	"al.essio.dev/pkg/shellescape"
+	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	toon "github.com/toon-format/toon-go"
 
-	"github.com/abhirup-dev/tail-mode/internal/deliver"
 	"github.com/abhirup-dev/tail-mode/internal/follow"
 	"github.com/abhirup-dev/tail-mode/internal/jobs"
 	"github.com/abhirup-dev/tail-mode/internal/source"
@@ -52,6 +55,10 @@ var (
 	waitJob       = follow.WaitCursor
 )
 
+// EnvThread is the caller's T3 thread from $T3CODE_THREAD_ID, trimmed ("" = not in T3): the one identity
+// source for the CLI, MCP and `tail-mode tool`.
+func EnvThread() string { return strings.TrimSpace(os.Getenv("T3CODE_THREAD_ID")) }
+
 // sharedMode reports whether the environment asks for shared mode (TAIL_MODE_SHARED=1, true, yes or on).
 func sharedMode() bool {
 	switch strings.ToLower(os.Getenv("TAIL_MODE_SHARED")) {
@@ -62,88 +69,174 @@ func sharedMode() bool {
 }
 
 func Serve(ctx context.Context) error {
-	s, err := store.Open(store.Dir())
+	s, err := store.Open("")
 	if err != nil {
 		return err
 	}
 	defer s.Close()
-	return newServer(s, sharedMode()).Run(ctx, &mcp.StdioTransport{})
+	return newServer(newHandler(s, false)).Run(ctx, &mcp.StdioTransport{})
 }
 
-// server holds what every tool needs. shared: the server's cwd is not the caller's. thread: the
-// caller's T3 thread, from this process's env ("" = none detected).
-type server struct {
-	s      *store.Store
-	shared bool
-	thread string
-}
-
-func newServer(s *store.Store, shared bool) *mcp.Server {
-	h := &server{s: s, shared: shared, thread: deliver.EnvThread()}
+func newServer(h *handler) *mcp.Server {
 	srv := mcp.NewServer(&mcp.Implementation{Name: "tail-mode", Version: "0.2.0"}, &mcp.ServerOptions{Instructions: instruction})
-	dirRule := "Local cmd: dir defaults to the server's current dir; pass an absolute dir (or ~/x) to be sure. Local file: an absolute path (or ~/x)."
-	if shared {
-		dirRule = "Local cmd: dir is required, an absolute path (or ~/x). Local file: an absolute path (or ~/x). Relative paths are refused."
+	for _, t := range h.tools() {
+		srv.AddTool(&mcp.Tool{Name: t.Name, Description: t.Description, InputSchema: t.InputSchema},
+			func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+				res := &mcp.CallToolResult{}
+				if text, err := t.call(ctx, req.Params.Arguments); err != nil {
+					res.SetError(err)
+				} else {
+					res.Content = []mcp.Content{&mcp.TextContent{Text: text}}
+				}
+				return res, nil
+			})
 	}
-	add(srv, "tail_start", "Run a long-running command (dev server, build, test watcher, remote script) or tail a log file in the "+
-		"background, instead of your own background shell; its output is stored and searchable. Required: exactly one of cmd, file, "+
-		"or source+config (sources: "+strings.Join(source.Kinds(), ", ")+"). host = an ssh host to run on; omit for local. "+
-		"dir and file paths are resolved on the target host for host jobs (local paths for local jobs; absolute required in shared mode). "+
-		dirRule+" env is exported in the job's shell on the target host (the remote host for host jobs). "+
-		"notify_every (default 30s, min 5s)/notify_match wake you with digests; in T3 they arrive in your own thread automatically (never pass a thread id). "+
-		`Example: {"name":"build","host":"vps","dir":"/srv/app","cmd":"./build.sh","env":{"MODE":"prod"},"notify_match":"ERROR|FAIL"}. `+
-		"Next: with notifications on, end your turn (digests wake you); otherwise tail_wait for a short wait until ready, "+
-		"tail_read for output, tail_stop when done.",
-		h.start)
-	add(srv, "tail_wait", "Block until a job prints a line matching until (a regex), e.g. a dev server's \"ready|listening\" line. "+
-		"For short waits (< ~1 min) only; with notifications on, end your turn instead. "+
-		"Required: job, until. Returns the matching lines and a cursor; or, after timeout (default 50s, max 5m), says it timed out "+
-		"and gives the cursor to wait again from; or, if the job ends first, its exit code and last lines. after is an exclusive "+
-		"cursor: only lines with id > after count (default 0, so a line printed before the call counts). For longer waits prefer "+
-		"tail_notify: it wakes you without blocking. "+dataNote,
-		h.wait)
-	add(srv, "tail_read", "Read a job's output lines oldest first, with its status, exit code and line count. Required: job (an id, "+
-		"or the name of one of your jobs). after is an exclusive cursor: returns lines with id > after (pass the returned cursor to "+
-		"get only new lines); tail=N for the newest N; "+
-		"grep=regex to filter. "+dataNote,
-		h.read)
-	add(srv, "tail_search", "Full-text search (SQLite FTS5 query syntax) across your jobs' output, newest first. Required: query. "+
-		"Narrow with job, since (e.g. 1h) or limit; all=true searches every owner's jobs. "+dataNote,
-		h.search)
-	add(srv, "tail_jobs", "List your jobs: status (with exit code once ended), line count, last output time. all=true lists every owner's jobs.",
-		h.jobsList)
-	add(srv, "tail_stop", "Stop a job and its processes. Required: job (an id, or the name of one of your jobs). Stopping a job that "+
-		"already ended is a no-op. Another owner's job is refused unless force=true.",
-		h.stop)
-	add(srv, "tail_notify", "Get woken with periodic digests of a job's new lines, and a final digest with the exit code when it ends, "+
-		"instead of polling. Required: job. In T3 digests arrive in your own thread automatically (detected from your session; never "+
-		"pass a thread id), each starting a new turn, so end your turn after calling it; elsewhere it returns how to get woken "+
-		"instead. One notifier per job and destination: calling it replaces any earlier one for this job, including the one "+
-		"tail_start set up with notify_every/notify_match. every (default 30s, min 5s), match (regex: only digest matching lines), "+
-		"after (exclusive cursor: lines with id > after; default now; 0 = from the job's first line). "+dataNote,
-		h.notifyTool)
-	add(srv, "tail_sql", "Read-only SQL when read/search are not enough: one SELECT, 5 s limit. Tables: jobs(id,name,owner,status,"+
-		"exit_code,error,started_at,ended_at,describe,...), lines(id,job,ts,text), notifiers(job,deliver,pid). Not scoped to you: "+
-		"filter on jobs.owner (tail_jobs shows yours). "+dataNote,
-		func(ctx context.Context, in SQLIn) (string, error) { return sqlText(ctx, s, in) })
 	return srv
 }
 
-// add registers a typed tool whose logic returns compact text. Errors become tool errors in the
-// "error: …\nhelp: …" shape.
-func add[In any](srv *mcp.Server, name, desc string, fn func(context.Context, In) (string, error)) {
-	mcp.AddTool(srv, &mcp.Tool{Name: name, Description: desc}, func(ctx context.Context, _ *mcp.CallToolRequest, in In) (*mcp.CallToolResult, any, error) {
-		text, err := fn(ctx, in)
-		if err != nil {
-			var te toolError
-			if !errors.As(err, &te) {
-				te = toolError{msg: err.Error()}
-			}
-			return nil, nil, te
+// Result is what `tail-mode tool` returns. Follow is set only for a client that delivers digests itself
+// (Pi) when a call turned notifications on: the client runs `tail-mode <Argv…>` and wakes on each jsonl line.
+type Result struct {
+	Text   string    `json:"text"`
+	Follow *Follower `json:"follow,omitempty"`
+}
+
+type Follower struct {
+	Job  string   `json:"job"`
+	Argv []string `json:"argv"`
+}
+
+// List is the tool set exactly as MCP advertises it (sorted by name).
+func List() []Tool {
+	ts := newHandler(nil, false).tools()
+	slices.SortFunc(ts, func(a, b Tool) int { return strings.Compare(a.Name, b.Name) })
+	return ts
+}
+
+// Exec runs one tool with JSON args as MCP would. pi: the client runs digest followers itself.
+func Exec(ctx context.Context, name string, args []byte, pi bool) (Result, error) {
+	s, err := store.Open("")
+	if err != nil {
+		return Result{}, err
+	}
+	defer s.Close()
+	return newHandler(s, pi).exec(ctx, name, args)
+}
+
+func (h *handler) exec(ctx context.Context, name string, args []byte) (Result, error) {
+	ts := h.tools()
+	i := slices.IndexFunc(ts, func(t Tool) bool { return t.Name == name })
+	if i < 0 {
+		return Result{}, fmt.Errorf("unknown tool %q (tail-mode tool --list)", name)
+	}
+	text, err := ts[i].call(ctx, args)
+	return Result{Text: text, Follow: h.follow}, err
+}
+
+// handler holds what every tool needs. shared: the process's cwd is not the caller's. thread: the
+// caller's T3 thread from the env ("" = none). pi: the client delivers digests itself; notify then
+// records follow instead of starting a notifier.
+type handler struct {
+	s      *store.Store
+	shared bool
+	thread string
+	pi     bool
+	follow *Follower
+}
+
+func newHandler(s *store.Store, pi bool) *handler {
+	return &handler{s: s, shared: sharedMode(), thread: EnvThread(), pi: pi}
+}
+
+// Tool is one tool: what clients list, and call, which validates JSON args against InputSchema, runs the
+// handler and returns its text (clipped to the budget) or an "error: …\nhelp: …" error.
+type Tool struct {
+	Name        string             `json:"name"`
+	Description string             `json:"description"`
+	InputSchema *jsonschema.Schema `json:"inputSchema"`
+	call        func(context.Context, json.RawMessage) (string, error)
+}
+
+func tool[In any](name, desc string, fn func(context.Context, In) (string, error)) Tool {
+	schema, err := jsonschema.For[In](nil)
+	if err != nil {
+		panic(err)
+	}
+	resolved, err := schema.Resolve(nil)
+	if err != nil {
+		panic(err)
+	}
+	return Tool{Name: name, Description: desc, InputSchema: schema, call: func(ctx context.Context, raw json.RawMessage) (string, error) {
+		if len(raw) == 0 {
+			raw = json.RawMessage("{}")
 		}
-		// Safety net only: read/search/sql/wait already fit the budget via render.
-		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: store.Clip(text, maxOut)}}}, nil, nil
-	})
+		var args map[string]any
+		var in In
+		if err := json.Unmarshal(raw, &args); err != nil {
+			return "", toolError{msg: "arguments: " + err.Error()}
+		}
+		if err := resolved.Validate(args); err != nil {
+			return "", toolError{msg: fmt.Sprintf("validating \"arguments\": %v", err)}
+		}
+		if err := json.Unmarshal(raw, &in); err != nil {
+			return "", toolError{msg: "arguments: " + err.Error()}
+		}
+		text, err := fn(ctx, in)
+		var te toolError
+		if err != nil && !errors.As(err, &te) {
+			err = toolError{msg: err.Error()}
+		}
+		return store.Clip(text, maxOut), err // the clip is a safety net: render already fits the budget
+	}}
+}
+
+func (h *handler) tools() []Tool {
+	dirRule := "Local cmd: dir defaults to the server's current dir; pass an absolute dir (or ~/x) to be sure. Local file: an absolute path (or ~/x)."
+	if h.shared {
+		dirRule = "Local cmd: dir is required, an absolute path (or ~/x). Local file: an absolute path (or ~/x). Relative paths are refused."
+	}
+	return []Tool{
+		tool("tail_start", "Run a long-running command (dev server, build, test watcher, remote script) or tail a log file in the "+
+			"background, instead of your own background shell; its output is stored and searchable. Required: exactly one of cmd, file, "+
+			"or source+config (sources: "+strings.Join(source.Kinds(), ", ")+"). host = an ssh host to run on; omit for local. "+
+			"dir and file paths are resolved on the target host for host jobs (local paths for local jobs; absolute required in shared mode). "+
+			dirRule+" env is exported in the job's shell on the target host (the remote host for host jobs). "+
+			"notify_every (default 30s, min 5s)/notify_match wake you with digests; in T3 and Pi they arrive in your own session automatically (never pass a thread id). "+
+			`Example: {"name":"build","host":"vps","dir":"/srv/app","cmd":"./build.sh","env":{"MODE":"prod"},"notify_match":"ERROR|FAIL"}. `+
+			"Next: with notifications on, end your turn (digests wake you); otherwise tail_wait for a short wait until ready, "+
+			"tail_read for output, tail_stop when done.",
+			h.start),
+		tool("tail_wait", "Block until a job prints a line matching until (a regex), e.g. a dev server's \"ready|listening\" line. "+
+			"For short waits (< ~1 min) only; with notifications on, end your turn instead. "+
+			"Required: job, until. Returns the matching lines and a cursor; or, after timeout (default 50s, max 5m), says it timed out "+
+			"and gives the cursor to wait again from; or, if the job ends first, its exit code and last lines. after is an exclusive "+
+			"cursor: only lines with id > after count (default 0, so a line printed before the call counts). For longer waits prefer "+
+			"tail_notify: it wakes you without blocking. "+dataNote,
+			h.wait),
+		tool("tail_read", "Read a job's output lines oldest first, with its status, exit code and line count. Required: job (an id, "+
+			"or the name of one of your jobs). after is an exclusive cursor: returns lines with id > after (pass the returned cursor to "+
+			"get only new lines); tail=N for the newest N; grep=regex to filter. "+dataNote,
+			h.read),
+		tool("tail_search", "Full-text search (SQLite FTS5 query syntax) across your jobs' output, newest first. Required: query. "+
+			"Narrow with job, since (e.g. 1h) or limit; all=true searches every owner's jobs. "+dataNote,
+			h.search),
+		tool("tail_jobs", "List your jobs: status (with exit code once ended), line count, last output time. all=true lists every owner's jobs.",
+			h.jobsList),
+		tool("tail_stop", "Stop a job and its processes. Required: job (an id, or the name of one of your jobs). Stopping a job that "+
+			"already ended is a no-op. Another owner's job is refused unless force=true.",
+			h.stop),
+		tool("tail_notify", "Get woken with periodic digests of a job's new lines, and a final digest with the exit code when it ends, "+
+			"instead of polling. Required: job. In T3 and Pi digests arrive in your own session automatically (detected from your session; never "+
+			"pass a thread id), each starting a new turn, so end your turn after calling it; elsewhere it returns how to get woken "+
+			"instead. One notifier per job and destination: calling it replaces any earlier one for this job, including the one "+
+			"tail_start set up with notify_every/notify_match. every (default 30s, min 5s), match (regex: only digest matching lines), "+
+			"after (exclusive cursor: lines with id > after; default now; 0 = from the job's first line). "+dataNote,
+			h.notifyTool),
+		tool("tail_sql", "Read-only SQL when read/search are not enough: one SELECT, 5 s limit. Tables: jobs(id,name,owner,status,"+
+			"exit_code,error,started_at,ended_at,describe,...), lines(id,job,ts,text), notifiers(job,deliver,pid). Not scoped to you: "+
+			"filter on jobs.owner (tail_jobs shows yours). "+dataNote,
+			h.sql),
+	}
 }
 
 // toolError is an error an agent can act on: what went wrong, and the call that fixes it.
@@ -265,7 +358,7 @@ type Caller struct {
 }
 
 // owner is the caller's job owner: the T3 thread from the env, else the owner label, else "" (shared).
-func (h *server) owner(c Caller) string {
+func (h *handler) owner(c Caller) string {
 	if h.thread != "" {
 		return h.thread
 	}
@@ -273,7 +366,7 @@ func (h *server) owner(c Caller) string {
 }
 
 // scope names whose jobs a call sees, for empty states and errors.
-func (h *server) scope(owner string) string {
+func (h *handler) scope(owner string) string {
 	switch {
 	case h.thread != "" && owner == h.thread:
 		return "this thread"
@@ -283,18 +376,24 @@ func (h *server) scope(owner string) string {
 	return "the shared namespace (no T3 thread detected; no owner given)"
 }
 
+// pushes reports whether digests can reach the caller: a T3 thread, or a client that delivers them itself.
+func (h *handler) pushes() bool { return h.pi || h.thread != "" }
+
 // destination says where notifications go.
-func (h *server) destination() string {
-	if h.thread == "" {
-		return "no T3 thread detected so nothing can be pushed to you; tail_wait blocks until a line matches"
+func (h *handler) destination() string {
+	switch {
+	case h.pi:
+		return "→ this Pi session (each digest arrives as a new message)"
+	case h.thread != "":
+		return "→ this T3 thread " + h.thread + " (detected from your session; you do not need to pass it)"
 	}
-	return "→ this T3 thread " + h.thread + " (detected from your session; you do not need to pass it)"
+	return "no T3 thread detected so nothing can be pushed to you; tail_wait blocks until a line matches"
 }
 
 const sharedWarning = "no T3 thread detected and no owner given so this job is in the shared namespace where other agents can see and stop it; pass owner (a stable label for yourself) to keep jobs yours"
 
 // job resolves ref for owner with an actionable not-found error.
-func (h *server) job(ref, owner string) (store.Job, error) {
+func (h *handler) job(ref, owner string) (store.Job, error) {
 	j, err := h.s.GetJob(ref, owner)
 	if errors.Is(err, store.ErrNotFound) {
 		return j, fail("tail_jobs lists your jobs (all=true: every owner's); a job id works for any owner's job",
@@ -365,39 +464,19 @@ func rawConfig(v any) (json.RawMessage, error) {
 	}
 }
 
-// localDefaults applies the adapters' local defaults to a local job (jobs.StartOpts.Resolve). Unshared,
-// relative paths resolve against the server's cwd (it runs in the agent's dir). Shared, the server's
-// cwd is not the caller's, so they are errors that say exactly what to pass. It checks the final spec,
-// so the generic source+config form is held to the same rule.
-func (h *server) localDefaults(o jobs.StartOpts) (jobs.StartOpts, error) {
-	if !h.shared && o.Local() {
-		var err error
-		if o.Cwd, err = os.Getwd(); err != nil {
-			return o, err
-		}
-	}
-	r, err := o.Resolve()
-	if errors.Is(err, source.ErrNeedAbsolute) {
-		why := fmt.Sprintf("%v; this server cannot see your current dir", err)
-		if o.Spec.Kind == "file" {
-			return o, fail(`pass the file as an absolute path, e.g. file="/home/me/app/logs/app.log", or as ~/x (run pwd in your shell to get your dir)`, "%s", why)
-		}
-		return o, fail(`pass dir as an absolute path, e.g. dir="/home/me/app" (with source+config, put "dir" in config), or as ~/x (run pwd in your shell to get your dir)`, "%s", why)
-	}
-	return r, err
-}
-
-func (h *server) start(_ context.Context, in StartIn) (string, error) {
+func (h *handler) start(_ context.Context, in StartIn) (string, error) {
 	o, err := startOpts(in)
 	if err != nil {
 		return "", err
 	}
 	o.Owner = h.owner(in.Caller)
-	if o, err = h.localDefaults(o); err != nil {
-		return "", err
+	if !h.shared { // shared: the cwd is not the caller's, so relative local paths are refused (ErrNeedAbsolute)
+		if o.Cwd, err = os.Getwd(); err != nil {
+			return "", err
+		}
 	}
 	wantNotify := in.NotifyEvery != "" || in.NotifyMatch != ""
-	var n follow.NotifierOpts
+	var n follow.Options
 	if wantNotify { // validate before starting, so a bad regex does not leave an unwatched job
 		// After 0: the job is new, so the notifier sees all of its lines, including backlog and fast output.
 		if n, err = notifyOpts("notify_every", in.NotifyEvery, in.NotifyMatch, 0); err != nil {
@@ -405,6 +484,13 @@ func (h *server) start(_ context.Context, in StartIn) (string, error) {
 		}
 	}
 	j, err := startJob(h.s, o)
+	if errors.Is(err, source.ErrNeedAbsolute) {
+		why := fmt.Sprintf("%v; this server cannot see your current dir", err)
+		if o.Spec.Kind == "file" {
+			return "", fail(`pass the file as an absolute path, e.g. file="/home/me/app/logs/app.log", or as ~/x (run pwd in your shell to get your dir)`, "%s", why)
+		}
+		return "", fail(`pass dir as an absolute path, e.g. dir="/home/me/app" (with source+config, put "dir" in config), or as ~/x (run pwd in your shell to get your dir)`, "%s", why)
+	}
 	if err != nil {
 		return "", err
 	}
@@ -412,10 +498,10 @@ func (h *server) start(_ context.Context, in StartIn) (string, error) {
 	if j.Name != "" {
 		fields = append(fields, f("name", j.Name))
 	}
-	fields = append(fields, h.resolved(o)...)
+	fields = append(fields, h.resolved(j)...)
 	fields = append(fields, f("source", store.Clip(store.OneLine(j.Describe), 200)), f("status", j.StatusText()))
 	out := kv(f("started", toon.NewObject(fields...)))
-	if o.Owner == "" {
+	if j.Owner == "" {
 		out += kv(f("warning", sharedWarning))
 	}
 	help := []string{
@@ -423,13 +509,13 @@ func (h *server) start(_ context.Context, in StartIn) (string, error) {
 		fmt.Sprintf("tail_read job=%s reads its output; tail_stop job=%s stops it", j.ID, j.ID),
 	}
 	switch {
-	case !wantNotify && h.thread != "":
+	case !wantNotify && h.pushes():
 		out += kv(f("notifications", "off; tail_notify sends digests "+h.destination()))
 	case !wantNotify:
 		out += kv(f("notifications", "off; "+h.destination()))
-	case h.thread == "":
+	case !h.pushes():
 		out += kv(f("notifications", h.destination()))
-		help = append(help[:1], deliver.RecipeLines(j.ID, n.Every, n.Match, n.After)...)
+		help = append(help[:1], RecipeLines(j.ID, n)...)
 	default:
 		if err := h.notify(j.ID, n); err != nil {
 			out += kv(f("notifications", "failed: "+err.Error()+" (the job is running)"))
@@ -442,10 +528,11 @@ func (h *server) start(_ context.Context, in StartIn) (string, error) {
 	return out + helpBlock(help...), nil
 }
 
-// resolved echoes what a start resolved to, so the agent sees as whom and where its job runs. In T3 the
-// owner is the caller's own thread, shown as such (weak agents read a raw id as something to act on).
-func (h *server) resolved(o jobs.StartOpts) []toon.Field {
-	owner := o.Owner
+// resolved echoes what a start resolved to (jobs.Start applied the local defaults), so the agent sees as
+// whom and where its job runs. In T3 the owner is the caller's own thread, shown as such (weak agents
+// read a raw id as something to act on).
+func (h *handler) resolved(j store.Job) []toon.Field {
+	owner := j.Owner
 	switch {
 	case owner == "":
 		owner = "none (shared namespace)"
@@ -453,29 +540,28 @@ func (h *server) resolved(o jobs.StartOpts) []toon.Field {
 		owner = "this T3 thread"
 	}
 	where := "local"
-	if !o.Local() {
-		where = o.Transport + " " + o.Target
+	if j.Target != "" {
+		where = j.Transport + " " + j.Target
 	}
 	out := []toon.Field{f("owner", owner), f("on", where)}
-	var cfg struct {
-		Dir  string `json:"dir"`
-		Path string `json:"path"`
+	var sp struct {
+		Config struct{ Dir, Path string }
 	}
-	_ = json.Unmarshal(o.Spec.Config, &cfg)
+	_ = json.Unmarshal([]byte(j.Spec), &sp)
 	switch {
-	case cfg.Dir != "":
-		out = append(out, f("dir", cfg.Dir))
-	case o.Spec.Kind == "cmd":
+	case sp.Config.Dir != "":
+		out = append(out, f("dir", sp.Config.Dir))
+	case j.Kind == "cmd":
 		out = append(out, f("dir", "~ (remote home)"))
 	}
-	if cfg.Path != "" {
-		out = append(out, f("path", cfg.Path))
+	if sp.Config.Path != "" {
+		out = append(out, f("path", sp.Config.Path))
 	}
 	return out
 }
 
 // notifyDesc describes a started notifier with its effective settings.
-func notifyDesc(n follow.NotifierOpts, from string) string {
+func notifyDesc(n follow.Options, from string) string {
 	s := "every " + n.Every.String()
 	if n.Match != "" {
 		s += " · only lines matching /" + n.Match + "/"
@@ -491,7 +577,7 @@ type StopIn struct {
 	Force bool   `json:"force,omitempty" jsonschema:"stop it even if it is another owner's job (do not stop other agents' jobs)"`
 }
 
-func (h *server) stop(_ context.Context, in StopIn) (string, error) {
+func (h *handler) stop(_ context.Context, in StopIn) (string, error) {
 	owner := h.owner(in.Caller)
 	j, err := h.job(in.Job, owner)
 	if err != nil {
@@ -522,7 +608,7 @@ type NotifyIn struct {
 	After *int64 `json:"after,omitempty" jsonschema:"exclusive cursor: digest lines with id > after (default: lines from now on; 0 = from the job's first line)"`
 }
 
-func (h *server) notifyTool(_ context.Context, in NotifyIn) (string, error) {
+func (h *handler) notifyTool(_ context.Context, in NotifyIn) (string, error) {
 	j, err := h.job(in.Job, h.owner(in.Caller))
 	if err != nil {
 		return "", err
@@ -535,10 +621,10 @@ func (h *server) notifyTool(_ context.Context, in NotifyIn) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if h.thread == "" {
+	if !h.pushes() {
 		return kv(f("notifications", "no T3 thread detected so nothing was started (this host has no push)")) +
 			helpBlock(append([]string{fmt.Sprintf("tail_wait job=%s until=<regex> blocks until a line matches (up to 5m per call)", j.ID)},
-				deliver.RecipeLines(j.ID, n.Every, n.Match, n.After)...)...), nil
+				RecipeLines(j.ID, n)...)...), nil
 	}
 	if err := h.notify(j.ID, n); err != nil {
 		return "", err
@@ -547,8 +633,8 @@ func (h *server) notifyTool(_ context.Context, in NotifyIn) (string, error) {
 		helpBlock(endTurn(j.ID)...), nil
 }
 
-// endTurn is the next step once digests go to the caller's T3 thread. Weak agents otherwise sleep or
-// block in a wait loop while the digests queue behind their turn, so it never suggests waiting.
+// endTurn is the next step once digests reach the caller. Weak agents otherwise sleep or block in a
+// wait loop while the digests queue behind their turn, so it never suggests waiting.
 func endTurn(id string) []string {
 	return []string{
 		"Notifications on. End your turn now: do not sleep, poll, or block waiting; each digest arrives here as a new message " +
@@ -557,10 +643,26 @@ func endTurn(id string) []string {
 	}
 }
 
+// RecipeLines tell a host without push (Claude Code) how to get woken on job: arm its Monitor tool on
+// `follow`, or run `wait` in the background. n.After < 0 means "from now on" (flag omitted).
+func RecipeLines(job string, n follow.Options) []string {
+	aft, m := "", ""
+	if n.After >= 0 {
+		aft = fmt.Sprintf(" --after %d", n.After)
+	}
+	if n.Match != "" {
+		m = " --match " + shellescape.Quote(n.Match)
+	}
+	return []string{
+		fmt.Sprintf("Arm the Monitor tool with: tail-mode follow %s --every %s%s%s", job, n.Every, m, aft),
+		fmt.Sprintf("or run in background: tail-mode wait %s --until RE --timeout 30m%s (exits 0 on match)", job, aft),
+	}
+}
+
 // notifyOpts parses and validates notifier params (param: the interval's name in this tool) into
-// NotifierOpts with the effective defaults filled in. after is the follower's start cursor (-1 = now).
-func notifyOpts(param, every, match string, after int64) (follow.NotifierOpts, error) {
-	n := follow.NotifierOpts{Match: match, After: after}
+// Options with the effective defaults filled in. after is the follower's start cursor (-1 = now).
+func notifyOpts(param, every, match string, after int64) (follow.Options, error) {
+	n := follow.Options{Match: match, After: after}
 	if every != "" {
 		d, err := time.ParseDuration(every)
 		if err != nil {
@@ -568,17 +670,19 @@ func notifyOpts(param, every, match string, after int64) (follow.NotifierOpts, e
 		}
 		n.Every = d
 	}
-	if _, err := regexp.Compile(match); err != nil {
-		return n, fail("fix the regex (Go RE2 syntax)", "match: %v", err)
-	}
 	if err := n.Validate(); err != nil {
-		return n, fail(fmt.Sprintf(`pass %s="30s" (the default) or any interval of at least 5s`, param), "%v", err)
+		return n, fail(fmt.Sprintf(`pass %s="30s" (the default) or any interval of at least 5s, and match as a Go RE2 regex`, param), "%v", err)
 	}
 	return n, nil
 }
 
-// notify starts (or replaces) the job's notifier to this T3 thread.
-func (h *server) notify(id string, n follow.NotifierOpts) error {
+// notify starts (or replaces) the job's digests to the caller: a T3 notifier, or the follower a Pi client runs.
+func (h *handler) notify(id string, n follow.Options) error {
+	if h.pi {
+		n.Deliver = "jsonl"
+		h.follow = &Follower{Job: id, Argv: n.FollowArgs(id)}
+		return nil
+	}
 	n.Deliver = "t3:" + h.thread
 	_, err := startNotifier(h.s, id, n)
 	return err
@@ -591,7 +695,7 @@ type JobsIn struct {
 	All bool `json:"all,omitempty" jsonschema:"list every owner's jobs, not just yours"`
 }
 
-func (h *server) jobsList(_ context.Context, in JobsIn) (string, error) {
+func (h *handler) jobsList(_ context.Context, in JobsIn) (string, error) {
 	owner := h.owner(in.Caller)
 	js, err := jobs.List(h.s, owner, in.All)
 	if err != nil {
@@ -639,13 +743,13 @@ type ReadIn struct {
 }
 
 // jobSummary is the aggregate header of a job: status with exit code, line count, last output.
-func (h *server) jobSummary(j store.Job) string {
+func (h *handler) jobSummary(j store.Job) string {
 	_ = h.s.Stats(&j)
 	j, _ = jobs.Refresh(h.s, j) // fresh effective status, exit code and error; keeps the stats
 	return fmt.Sprintf("%s · %s · %d lines total · last output %s", j.Label(), store.Clip(j.StatusText(), 300), j.Lines, store.Ago(j.LastTS, "never"))
 }
 
-func (h *server) read(_ context.Context, in ReadIn) (string, error) {
+func (h *handler) read(_ context.Context, in ReadIn) (string, error) {
 	j, err := h.job(in.Job, h.owner(in.Caller))
 	if err != nil {
 		return "", err
@@ -698,7 +802,7 @@ type WaitIn struct {
 	After   *int64 `json:"after,omitempty" jsonschema:"exclusive cursor: only lines with id > after count (default 0 = from the job's first line; pass the returned cursor to wait for newer lines)"`
 }
 
-func (h *server) wait(ctx context.Context, in WaitIn) (string, error) {
+func (h *handler) wait(ctx context.Context, in WaitIn) (string, error) {
 	j, err := h.job(in.Job, h.owner(in.Caller))
 	if err != nil {
 		return "", err
@@ -763,7 +867,7 @@ type SearchIn struct {
 	Limit int    `json:"limit,omitempty" jsonschema:"max lines (default 50)"`
 }
 
-func (h *server) search(_ context.Context, in SearchIn) (string, error) {
+func (h *handler) search(_ context.Context, in SearchIn) (string, error) {
 	owner := h.owner(in.Caller)
 	q := store.SearchQuery{Query: in.Query, Limit: in.Limit, Owner: owner, All: in.All}
 	scope := "the jobs of " + h.scope(owner)
@@ -815,13 +919,13 @@ type SQLIn struct {
 	Limit int    `json:"limit,omitempty" jsonschema:"max rows (default 500)"`
 }
 
-func sqlText(ctx context.Context, s *store.Store, in SQLIn) (string, error) {
+func (h *handler) sql(ctx context.Context, in SQLIn) (string, error) {
 	if in.Limit <= 0 {
 		in.Limit = 500
 	}
 	ctx, cancel := context.WithTimeout(ctx, sqlTimeout)
 	defer cancel()
-	cols, rows, err := s.Query(ctx, in.Query, in.Limit)
+	cols, rows, err := h.s.Query(ctx, in.Query, in.Limit)
 	if err != nil {
 		return "", fail("one read-only SELECT over jobs, lines, notifiers; e.g. SELECT id,status,exit_code FROM jobs WHERE owner='<owner>'", "sql: %v", err)
 	}

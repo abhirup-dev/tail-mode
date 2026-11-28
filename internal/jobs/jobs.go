@@ -47,7 +47,7 @@ type StartOpts struct {
 func (o StartOpts) Local() bool { return o.Transport == "" || o.Transport == "local" }
 
 // Resolve applies source.LocalDefaults against o.Cwd to a local job (remote jobs keep the remote's
-// defaults). Idempotent: Start calls it; integrations call it first to validate and echo the result.
+// defaults). Start calls it, and the returned job's Spec is the resolved one.
 func (o StartOpts) Resolve() (StartOpts, error) {
 	if !o.Local() {
 		return o, nil

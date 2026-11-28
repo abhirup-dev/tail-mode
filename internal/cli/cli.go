@@ -22,9 +22,9 @@ import (
 	"github.com/abhirup-dev/tail-mode/internal/deliver"
 	"github.com/abhirup-dev/tail-mode/internal/follow"
 	"github.com/abhirup-dev/tail-mode/internal/jobs"
-	"github.com/abhirup-dev/tail-mode/internal/mcpserver"
 	"github.com/abhirup-dev/tail-mode/internal/source"
 	"github.com/abhirup-dev/tail-mode/internal/store"
+	"github.com/abhirup-dev/tail-mode/internal/tools"
 )
 
 // stdout is where command output goes (a test knob).
@@ -47,6 +47,7 @@ type root struct {
 	Wait   waitCmd   `cmd:"" help:"Wait for a matching line (exit 0; 3 on timeout; 4 if the job ended)."`
 	Notify notifyCmd `cmd:"" help:"Start a detached follower that pushes digests to an agent."`
 	MCP    mcpCmd    `cmd:"" name:"mcp" help:"Run the stdio MCP server."`
+	Tool   toolCmd   `cmd:"" hidden:"" help:"Run one MCP tool (tail-mode tool --list | tail-mode tool NAME [JSON|-] [--client pi])."`
 	Job    jobCmd    `cmd:"" name:"_job" hidden:"" help:"Internal: run a job's worker."`
 }
 
@@ -54,7 +55,7 @@ func parse(r *root, args []string) (*kong.Context, error) {
 	p, err := kong.New(r, kong.Name("tail-mode"),
 		kong.Description("Tail local/remote logs and commands for coding agents."),
 		kong.Writers(stdout, os.Stderr),
-		kong.Vars{"every": follow.DefaultEvery.String(), "maxLines": strconv.Itoa(follow.DefaultMaxLines)},
+		kong.Vars{"every": follow.DefaultEvery.String(), "maxLines": strconv.Itoa(follow.DefaultMaxLines), "owner": tools.EnvThread()},
 		kong.WithHyphenPrefixedParameters(true)) // flag values may start with "-": --after -1, --grep -x
 	if err != nil {
 		return nil, err
@@ -85,7 +86,7 @@ var (
 // ownerOpt scopes a command to one owner: job names resolve among that owner's jobs, and new jobs
 // get it. In T3 it defaults to the thread id, so each agent thread has its own namespace.
 type ownerOpt struct {
-	Owner string `env:"T3CODE_THREAD_ID" placeholder:"O" help:"Job owner: names resolve among its jobs, new jobs get it (default $T3CODE_THREAD_ID; '' = shared namespace)."`
+	Owner string `default:"${owner}" placeholder:"O" help:"Job owner: names resolve among its jobs, new jobs get it (default $T3CODE_THREAD_ID; '' = shared namespace)."`
 }
 
 // cmdOpts are the cmd source's options, shared by start and run.
@@ -134,12 +135,8 @@ func startOpts(name, owner, host string, sp source.Spec) jobs.StartOpts {
 	return o
 }
 
-// start resolves o's local defaults, starts the job and prints it.
+// start starts the job and prints it.
 func start(s *store.Store, o jobs.StartOpts, asJSON bool) (store.Job, error) {
-	o, err := o.Resolve()
-	if err != nil {
-		return store.Job{}, err
-	}
 	j, err := startJob(s, o)
 	if err != nil {
 		return j, err
@@ -167,7 +164,7 @@ type startCmd struct {
 	JSON      bool `name:"json" help:"JSON output."`
 }
 
-// opts turns the flags (and their sugar) into jobs.StartOpts (local defaults not yet applied).
+// opts turns the flags (and their sugar) into jobs.StartOpts.
 func (c *startCmd) opts() (jobs.StartOpts, error) {
 	in := source.SpecInput{CmdConfig: source.CmdConfig{Cmd: c.Cmd}, File: c.File, Backlog: c.Backlog, Source: c.Source, Restart: c.Restart}
 	if c.Config != "" {
@@ -231,20 +228,16 @@ func (c *runCmd) Run() error {
 	if len(argv) == 0 {
 		return errors.New("run: no command (tail-mode run [flags] -- CMD...)")
 	}
-	match, err := compile(c.Match)
-	if err != nil {
-		return err
-	}
 	until, err := compile(c.Until)
 	if err != nil {
 		return err
 	}
-	wantNotify := c.Every != 0 || match != nil
+	wantNotify := c.Every != 0 || c.Match != ""
 	if !wantNotify && (c.Deliver != "" || c.Thread != "") {
 		return errors.New("--deliver/--thread need --every or --match")
 	}
 	// After 0: the job is new, so the notifier sees all of its lines, including fast early output.
-	n := follow.NotifierOpts{Every: c.Every, Match: c.Match, MaxLines: c.MaxLines, After: 0}
+	n := follow.Options{Every: c.Every, Match: c.Match, MaxLines: c.MaxLines, After: 0}
 	if err := n.Validate(); wantNotify && err != nil { // before starting, so a bad flag leaves no job
 		return err
 	}
@@ -276,10 +269,10 @@ func (c *runCmd) Run() error {
 
 // notify starts run's notifier for job (deliver resolved like notify), or prints the recipe when
 // there is no destination.
-func (c *runCmd) notify(s *store.Store, job string, n follow.NotifierOpts) error {
+func (c *runCmd) notify(s *store.Store, job string, n follow.Options) error {
 	var msg string
 	if n.Deliver = resolveDeliver(c.Deliver, c.Thread); n.Deliver == "" {
-		msg = "No T3 thread; to get woken:\n- " + strings.Join(deliver.RecipeLines(job, n.Every, n.Match, n.After), "\n- ")
+		msg = "No T3 thread; to get woken:\n- " + strings.Join(tools.RecipeLines(job, n), "\n- ")
 	} else {
 		pid, err := startNotifier(s, job, n)
 		if err != nil {
@@ -493,13 +486,6 @@ type followCmd struct {
 }
 
 func (c *followCmd) Run() error {
-	if err := (&follow.NotifierOpts{Every: c.Every, Match: c.Match, MaxLines: c.MaxLines}).Validate(); err != nil {
-		return err
-	}
-	re, err := compile(c.Match)
-	if err != nil {
-		return err
-	}
 	sink, err := deliver.New(c.Deliver)
 	if err != nil {
 		return err
@@ -518,7 +504,7 @@ func (c *followCmd) Run() error {
 	}
 	ctx, stop := signalCtx()
 	defer stop()
-	err = follow.Follow(ctx, s, j, follow.Options{Every: c.Every, Match: re, MaxLines: c.MaxLines, After: c.After}, sink)
+	err = follow.Follow(ctx, s, j, follow.Options{Every: c.Every, Match: c.Match, MaxLines: c.MaxLines, After: c.After}, sink)
 	if errors.Is(err, context.Canceled) {
 		return nil
 	}
@@ -579,7 +565,7 @@ func resolveDeliver(deliverFlag, thread string) string {
 		return deliverFlag
 	}
 	if thread == "" {
-		thread = deliver.EnvThread()
+		thread = tools.EnvThread()
 	}
 	if thread == "" {
 		return ""
@@ -604,7 +590,7 @@ func (c *notifyCmd) Run() error {
 		return err
 	}
 	defer s.Close()
-	pid, err := startNotifier(s, j.ID, follow.NotifierOpts{Every: c.Every, Match: c.Match, MaxLines: c.MaxLines, After: c.After, Deliver: spec})
+	pid, err := startNotifier(s, j.ID, follow.Options{Every: c.Every, Match: c.Match, MaxLines: c.MaxLines, After: c.After, Deliver: spec})
 	if err != nil {
 		return err
 	}
@@ -617,7 +603,41 @@ type mcpCmd struct{}
 func (mcpCmd) Run() error {
 	ctx, stop := signalCtx()
 	defer stop()
-	return mcpserver.Serve(ctx)
+	return tools.Serve(ctx)
+}
+
+// toolCmd runs the MCP tools for clients that are not MCP (the Pi extension). The text and the exit
+// status match the MCP result; tool errors are printed to stdout too.
+type toolCmd struct {
+	List   bool   `help:"Print the tools (name, description, inputSchema) as JSON."`
+	Client string `enum:",pi" default:"" help:"pi: the client runs digest followers itself; prints {text, follow?} JSON."`
+	Name   string `arg:"" optional:"" help:"Tool name."`
+	Args   string `arg:"" optional:"" default:"{}" help:"JSON arguments, or - for stdin."`
+}
+
+func (c *toolCmd) Run() error {
+	if c.List {
+		return printJSON(tools.List())
+	}
+	args := []byte(c.Args)
+	if c.Args == "-" {
+		var err error
+		if args, err = io.ReadAll(os.Stdin); err != nil {
+			return err
+		}
+	}
+	ctx, stop := signalCtx()
+	defer stop()
+	r, err := tools.Exec(ctx, c.Name, args, c.Client == "pi")
+	switch {
+	case err != nil:
+		fmt.Fprintln(stdout, err)
+		return ExitError{Code: 1}
+	case c.Client == "pi":
+		return printJSON(r)
+	}
+	_, err = io.WriteString(stdout, r.Text)
+	return err
 }
 
 // ---- helpers
