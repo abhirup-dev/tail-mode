@@ -5,32 +5,20 @@ import (
 	"encoding/base64"
 	"fmt"
 	"os/exec"
-	"strings"
-	"unicode"
 
 	"al.essio.dev/pkg/shellescape"
 )
 
 func init() {
 	Register("ssh", func(host string) (Transport, error) {
-		if err := checkHost(host); err != nil {
-			return nil, err
+		if host == "" {
+			return nil, fmt.Errorf("ssh transport needs a host")
+		}
+		if err := CheckWord(host); err != nil {
+			return nil, fmt.Errorf("invalid ssh host %q: %w", host, err)
 		}
 		return ssh{host}, nil
 	})
-}
-
-// checkHost rejects hosts that ssh could parse as options or that would split into several words.
-func checkHost(h string) error {
-	switch {
-	case h == "":
-		return fmt.Errorf("ssh transport needs a host")
-	case strings.HasPrefix(h, "-"):
-		return fmt.Errorf("invalid ssh host %q: starts with '-'", h)
-	case strings.IndexFunc(h, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0:
-		return fmt.Errorf("invalid ssh host %q: contains whitespace or control characters", h)
-	}
-	return nil
 }
 
 // ssh runs argv on host through the system ssh, so ~/.ssh/config, agents, ProxyJump and ControlMaster

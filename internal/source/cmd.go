@@ -9,7 +9,6 @@ import (
 	"regexp"
 	"slices"
 	"strings"
-	"unicode"
 
 	"github.com/abhirup-dev/tail-mode/internal/transport"
 )
@@ -23,7 +22,7 @@ type CmdConfig struct {
 	Login bool              `json:"login,omitempty"` // run as a login shell (-lc): profile files set PATH etc.
 }
 
-const defaultShell = "bash"
+const DefaultShell = "bash"
 
 // defaultEnv is exported unless the config sets the same key. Python block-buffers stdout when it is not
 // a terminal, so without this its lines would arrive only at exit.
@@ -54,12 +53,10 @@ func (c CmdConfig) validate() error {
 		}
 	}
 	if sh := c.Shell; sh != "" {
-		switch {
-		case strings.IndexFunc(sh, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0:
-			return fmt.Errorf("cmd source: invalid shell %q: contains whitespace or control characters", sh)
-		case strings.HasPrefix(sh, "-"):
-			return fmt.Errorf("cmd source: invalid shell %q: starts with '-'", sh)
-		case strings.Contains(sh, "/") && !filepath.IsAbs(sh):
+		if err := transport.CheckWord(sh); err != nil {
+			return fmt.Errorf("cmd source: invalid shell %q: %w", sh, err)
+		}
+		if strings.Contains(sh, "/") && !filepath.IsAbs(sh) {
 			return fmt.Errorf("cmd source: shell %q must be a bare name or an absolute path", sh)
 		}
 	}
@@ -79,7 +76,7 @@ func (c command) Stream(ctx context.Context, t transport.Transport, _ bool, emit
 func (c command) argv() []string {
 	sh, flag := c.Shell, "-c"
 	if sh == "" {
-		sh = defaultShell
+		sh = DefaultShell
 	}
 	if c.Login {
 		flag = "-lc"

@@ -18,10 +18,11 @@ import (
 	"github.com/abhirup-dev/tail-mode/internal/testutil"
 )
 
-// fakeSink records delivered digests; fail(d) decides whether a delivery attempt fails.
+// fakeSink records delivered digests and when; fail(d) decides whether a delivery attempt fails.
 type fakeSink struct {
 	mu    sync.Mutex
 	ds    []deliver.Digest
+	at    []time.Time
 	tries int
 	fail  func(d deliver.Digest, try int) bool
 }
@@ -33,7 +34,7 @@ func (f *fakeSink) Deliver(_ context.Context, d deliver.Digest) error {
 	if f.fail != nil && f.fail(d, f.tries) {
 		return errors.New("sink down")
 	}
-	f.ds = append(f.ds, d)
+	f.ds, f.at = append(f.ds, d), append(f.at, time.Now())
 	return nil
 }
 
@@ -48,8 +49,8 @@ func (f *fakeSink) n() int { ds, _ := f.get(); return len(ds) }
 // setup creates a running job "web"; live holds its lock (as its worker would), else it is lost.
 func setup(t *testing.T, live bool) (*store.Store, store.Job) {
 	t.Helper()
-	testutil.Swap(t, &minEvery, 20*time.Millisecond)
-	testutil.Swap(t, &waitEvery, 20*time.Millisecond)
+	testutil.Swap(t, &MinEvery, 20*time.Millisecond)
+	testutil.Swap(t, &pollEvery, 20*time.Millisecond)
 	s := testutil.Store(t)
 	if live {
 		return s, testutil.LiveJob(t, s, store.Job{Name: "web"})
@@ -57,35 +58,46 @@ func setup(t *testing.T, live bool) (*store.Store, store.Job) {
 	return s, testutil.Job(t, s, store.Job{Name: "web", Status: "running"})
 }
 
+// Every is the minimum gap between digests: the first match goes out at once (on the next poll), the
+// next only once Every has passed; non-matching lines alone deliver nothing; the final digest carries
+// the job's last line even though it did not match.
 func TestFollowMatchAndFinal(t *testing.T) {
 	s, j := setup(t, true)
 	s.Append(j.ID, []string{"old line"}, store.NowMS())
 	sink := &fakeSink{}
 	done := make(chan error, 1)
+	const every = time.Second
 	go func() {
-		done <- Follow(context.Background(), s, j, Options{Every: minEvery, Match: "ERR", MaxLines: 2, After: 1}, sink)
+		done <- Follow(context.Background(), s, j, Options{Every: every, Match: "ERR", MaxLines: 2, After: 1}, sink)
 	}()
+	appended := time.Now()
 	s.Append(j.ID, []string{"ok", "ERR a", "ERR b", "ERR " + strings.Repeat("x", 400)}, store.NowMS())
-	testutil.WaitFor(t, 2*time.Second, func() bool { return sink.n() == 1 })
+	testutil.WaitFor(t, every, func() bool { return sink.n() == 1 })
 	ds, _ := sink.get()
 	d := ds[0]
 	if d.New != 4 || d.Matched != 3 || len(d.Lines) != 2 || d.Lines[0].Text != "ERR b" || d.Final || len(d.Lines[1].Text) > 310 {
 		t.Fatalf("bad digest %+v", d)
 	}
+	s.Append(j.ID, []string{"ERR c"}, store.NowMS())
+	testutil.WaitFor(t, 3*every, func() bool { return sink.n() == 2 })
 	s.Append(j.ID, []string{"no match"}, store.NowMS())
-	time.Sleep(3 * minEvery) // a negative check: ticks pass, and non-matching lines alone deliver nothing
+	time.Sleep(3 * pollEvery) // a negative check
 	s.Finish(j.ID, "exited", 3, "", false)
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
 	ds, _ = sink.get()
 	f := ds[len(ds)-1]
-	if len(ds) != 2 || !f.Final || f.Status != "exited" || f.ExitCode == nil || *f.ExitCode != 3 || f.New != 1 || f.From != d.To {
+	if len(ds) != 3 || !f.Final || f.Status != "exited" || f.ExitCode == nil || *f.ExitCode != 3 || f.New != 1 || f.From != ds[1].To {
 		t.Fatalf("bad final %+v of %d digests", f, len(ds))
 	}
-	// The final digest carries the job's last line even though it did not match.
-	if f.LastLine == nil || f.LastLine.Text != "no match" || f.LastMatched || f.Total != 6 {
+	if f.LastLine == nil || f.LastLine.Text != "no match" || f.LastMatched || f.Total != 7 {
 		t.Fatalf("final summary %+v %+v", f, f.LastLine)
+	}
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	if first, gap := sink.at[0].Sub(appended), sink.at[1].Sub(sink.at[0]); first >= every || gap < every {
+		t.Fatalf("first digest after %v, second %v later", first, gap)
 	}
 }
 
@@ -94,8 +106,8 @@ func TestFollowCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	sink := &fakeSink{}
-	go func() { done <- Follow(ctx, s, j, Options{Every: minEvery, After: -1}, sink) }()
-	time.Sleep(3 * minEvery) // a negative check: empty ticks deliver nothing
+	go func() { done <- Follow(ctx, s, j, Options{Every: MinEvery, After: -1}, sink) }()
+	time.Sleep(3 * MinEvery) // a negative check: empty ticks deliver nothing
 	cancel()
 	if err := <-done; err != context.Canceled || sink.n() != 0 {
 		t.Fatalf("got %v, %d digests", err, sink.n())
@@ -130,7 +142,7 @@ func TestFollowNonFinalFailureKeepsNews(t *testing.T) {
 	s, j := setup(t, true)
 	sink := &fakeSink{fail: func(d deliver.Digest, try int) bool { return try == 1 }}
 	done := make(chan error, 1)
-	go func() { done <- Follow(context.Background(), s, j, Options{Every: minEvery, After: 0}, sink) }()
+	go func() { done <- Follow(context.Background(), s, j, Options{Every: MinEvery, After: 0}, sink) }()
 	s.Append(j.ID, []string{"a", "b"}, store.NowMS())
 	testutil.WaitFor(t, 2*time.Second, func() bool { _, tries := sink.get(); return tries >= 1 })
 	s.Append(j.ID, []string{"c"}, store.NowMS())
@@ -152,21 +164,21 @@ func TestFollowFinal(t *testing.T) {
 	s, j := setup(t, true)
 	s.Finish(j.ID, "exited", 0, "", false)
 	sink := &fakeSink{fail: func(d deliver.Digest, try int) bool { return try <= 2 }} // flaky: 2 failures
-	if err := Follow(context.Background(), s, j, Options{Every: minEvery, After: 0}, sink); err != nil {
+	if err := Follow(context.Background(), s, j, Options{Every: MinEvery, After: 0}, sink); err != nil {
 		t.Fatal(err)
 	}
 	if ds, tries := sink.get(); len(ds) != 1 || !ds[0].Final || tries != 3 {
 		t.Fatalf("tries %d digests %+v", tries, ds)
 	}
 	sink = &fakeSink{fail: func(deliver.Digest, int) bool { return true }}
-	err := Follow(context.Background(), s, j, Options{Every: minEvery, After: 0}, sink)
+	err := Follow(context.Background(), s, j, Options{Every: MinEvery, After: 0}, sink)
 	if _, tries := sink.get(); err == nil || !strings.Contains(err.Error(), "sink down") || tries != 4 {
 		t.Fatalf("want error after 1+3 tries, got %v after %d", err, tries)
 	}
 
 	s, lost := setup(t, false)
 	sink = &fakeSink{}
-	if err := Follow(context.Background(), s, lost, Options{Every: minEvery, After: 0}, sink); err != nil {
+	if err := Follow(context.Background(), s, lost, Options{Every: MinEvery, After: 0}, sink); err != nil {
 		t.Fatal(err)
 	}
 	if ds, _ := sink.get(); len(ds) != 1 || !ds[0].Final || ds[0].Status != "lost" {
@@ -204,7 +216,10 @@ func TestRegisterRace(t *testing.T) {
 		t.Fatalf("winner row %+v %v", n, ok)
 	}
 	(<-releases)()
-	if ns, _ := s.ListNotifiers(j.ID); len(ns) != 1 || ns[0].Deliver != "jsonl" {
-		t.Fatalf("after release: %+v", ns)
+	if _, ok, _ := s.GetNotifier(j.ID, "t3:x"); ok {
+		t.Fatal("released row left")
+	}
+	if _, ok, _ := s.GetNotifier(j.ID, "jsonl"); !ok {
+		t.Fatal("release removed the other destination's row")
 	}
 }

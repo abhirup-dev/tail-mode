@@ -212,11 +212,12 @@ func TestStartValidates(t *testing.T) {
 	}
 }
 
-// End to end through a real detached worker (this test binary, see TestMain).
+// End to end through a real detached worker (this test binary, see TestMain). Stop sends the source's
+// process group SIGTERM before SIGKILL, so it can say goodbye: the line is kept and the job is stopped.
 func TestStartStopWorker(t *testing.T) {
 	s := testutil.Store(t)
-	b, _ := json.Marshal(fake{Batches: [][]string{{"one", "two"}}, Hold: true})
-	j, err := Start(s, StartOpts{Name: "w", Spec: source.Spec{Kind: "fake", Config: b}})
+	b, _ := json.Marshal(source.CmdConfig{Cmd: "trap 'echo bye; exit 0' TERM; echo ready; sleep 30 & wait", Dir: "/"})
+	j, err := Start(s, StartOpts{Name: "w", Spec: source.Spec{Kind: "cmd", Config: b}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,13 +228,13 @@ func TestStartStopWorker(t *testing.T) {
 	if !proc.Locked(s.JobLock(j.ID)) || Status(s, j) != "running" {
 		t.Fatal("worker does not hold its lock")
 	}
-	testutil.WaitFor(t, 3*time.Second, lines(t, s, j.ID, 2))
-	if js, _ := List(s, "", true); len(js) != 1 || js[0].Status != "running" || js[0].Lines != 2 {
+	testutil.WaitFor(t, 3*time.Second, lines(t, s, j.ID, 1))
+	if js, _ := List(s, "", true); len(js) != 1 || js[0].Status != "running" || js[0].Lines != 1 {
 		t.Fatalf("list %+v", js)
 	}
 	j, err = Stop(s, "w", "", false)
-	if err != nil || j.Status != "stopped" || proc.Locked(s.JobLock(j.ID)) {
-		t.Fatalf("stop: %v %+v", err, j)
+	if err != nil || j.Status != "stopped" || proc.Locked(s.JobLock(j.ID)) || !reflect.DeepEqual(texts(t, s, j.ID), []string{"ready", "bye"}) {
+		t.Fatalf("stop: %v %+v %q", err, j, texts(t, s, j.ID))
 	}
 	testutil.WaitDead(t, j.PID) // it released its lock just before exiting; Detach's goroutine reaps it
 }

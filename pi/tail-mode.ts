@@ -1,6 +1,7 @@
 // tail-mode for Pi: registers the tools `tail-mode tool --list` advertises (the MCP tool set) and runs each
-// through `tail-mode tool <name> - --client=pi`. The only Pi logic is the wake mechanism: when a result
-// carries a follower, run it and turn each jsonl digest into a message that starts a turn.
+// through `tail-mode tool <name> - --client=pi`, as this session's owner (TAIL_MODE_OWNER=pi:<session id>).
+// The only Pi logic is the wake mechanism: when a result carries a follower, run it and turn each jsonl
+// digest into a message that starts a turn.
 // Type-check: see README.md ("Develop").
 
 import { execFile, execFileSync, spawn, type ChildProcess } from "node:child_process";
@@ -29,7 +30,9 @@ export default function tailMode(pi: ExtensionAPI): void {
     followers.set(job, child);
     let stderr = "";
     child.stderr!.on("data", (b: Buffer) => { stderr = (stderr + b.toString()).slice(-2048); });
+    const current = () => followers.get(job) === child; // a replaced follower is ignored
     createInterface({ input: child.stdout! }).on("line", (line) => {
+      if (!current()) return;
       try {
         const d = JSON.parse(line) as { text: string };
         wake(d.text, d);
@@ -37,7 +40,8 @@ export default function tailMode(pi: ExtensionAPI): void {
     });
     child.on("error", (e) => wake(`[tail-mode] follower for ${job} did not start: ${e.message}`, { job }));
     child.on("exit", (code) => {
-      if (followers.get(job) === child) followers.delete(job);
+      if (!current()) return;
+      followers.delete(job);
       if (code) wake(`[tail-mode] follower for ${job} failed (exit ${code}): ${stderr.trim()}`, { job, code });
     });
   };
@@ -49,10 +53,12 @@ export default function tailMode(pi: ExtensionAPI): void {
       label: t.name.replace("_", " "),
       description: t.description,
       parameters: Type.Unsafe<Record<string, unknown>>(t.inputSchema),
-      execute: (_id, params, signal) => new Promise<ReturnType<typeof result>>((resolve) => {
-        const child = execFile(BIN, ["tool", t.name, "-", "--client=pi"], { signal, maxBuffer: 16 << 20 }, (err, out, errOut) => {
+      execute: (_id, params, signal, _update, ctx) => new Promise<ReturnType<typeof result>>((resolve) => {
+        const env = { ...process.env, TAIL_MODE_OWNER: `pi:${ctx.sessionManager.getSessionId() || process.pid}` };
+        const child = execFile(BIN, ["tool", t.name, "-", "--client=pi"], { signal, env, maxBuffer: 16 << 20 }, (err, out, errOut) => {
           if (err) return resolve(result(out.trim() || errOut.trim() || err.message, true));
-          const r = JSON.parse(out) as { text: string; follow?: Follower };
+          let r: { text: string; follow?: Follower };
+          try { r = JSON.parse(out); } catch { return resolve(result(`tail-mode ${t.name}: unreadable output: ${out.slice(0, 500)}`, true)); }
           if (r.follow) follow(r.follow);
           resolve(result(r.text));
         });

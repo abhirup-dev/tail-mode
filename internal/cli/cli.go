@@ -12,7 +12,6 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -56,7 +55,7 @@ func parse(r *root, args []string) (*kong.Context, error) {
 	p, err := kong.New(r, kong.Name("tail-mode"),
 		kong.Description("Tail local/remote logs and commands for coding agents."),
 		kong.Writers(stdout, os.Stderr),
-		kong.Vars{"every": follow.DefaultEvery.String(), "maxLines": strconv.Itoa(follow.DefaultMaxLines), "owner": tools.EnvThread()},
+		kong.Vars(tools.Vars), kong.Vars{"owner": tools.EnvOwner()},
 		kong.WithHyphenPrefixedParameters(true)) // flag values may start with "-": --after -1, --grep -x
 	if err != nil {
 		return nil, err
@@ -114,7 +113,7 @@ func call(name string, args any) (tools.Result, error) {
 // ownerOpt scopes a command to one owner: job names resolve among its jobs, and new jobs get it. In T3 it
 // defaults to the thread id, so each agent thread has its own namespace.
 type ownerOpt struct {
-	Owner string `default:"${owner}" placeholder:"O" help:"Job owner: names resolve among its jobs, new jobs get it (default $T3CODE_THREAD_ID; '' = shared namespace)."`
+	Owner string `default:"${owner}" placeholder:"O" help:"Job owner: names resolve among its jobs, new jobs get it (default $T3CODE_THREAD_ID, else $TAIL_MODE_OWNER; '' = shared namespace)."`
 }
 
 func (o ownerOpt) caller() tools.Caller { return tools.Caller{Owner: o.Owner} }
@@ -123,7 +122,7 @@ func (o ownerOpt) caller() tools.Caller { return tools.Caller{Owner: o.Owner} }
 type cmdOpts struct {
 	Dir   string            `placeholder:"D" help:"With a command: working dir (default: the current dir; remote: home). Quote '~/x' so it is the target's home."`
 	Env   map[string]string `placeholder:"K=V" mapsep:"none" help:"With a command: export K=V before it (repeatable). PYTHONUNBUFFERED=1 is set unless given."`
-	Shell string            `placeholder:"S" help:"With a command: POSIX shell to run it with, name or absolute path (default bash)."`
+	Shell string            `placeholder:"S" help:"With a command: POSIX shell to run it with, name or absolute path (default ${shell})."`
 	Login bool              `help:"With a command: run it in a login shell (-lc), so profile files set PATH."`
 }
 
@@ -136,7 +135,7 @@ type startCmd struct {
 	Host     string `placeholder:"H" help:"SSH host to run on (default local)."`
 	Restart  *bool  `negatable:"" help:"Restart when the source ends (default: file yes, cmd no)."`
 	File     string `placeholder:"PATH" help:"File to tail; sugar for --source file. Quote '~/x' so it is the target's home." xor:"source" required:""`
-	Backlog  *int   `placeholder:"N" help:"With --file: lines of history to read first (default 50)."`
+	Backlog  *int   `placeholder:"N" help:"With --file: lines of history to read first (default ${backlog})."`
 	Cmd      string `placeholder:"CMD" help:"Command to run; sugar for --source cmd." xor:"source" required:""`
 	Source   string `placeholder:"KIND" help:"Source kind." xor:"source" required:""`
 	Config   string `placeholder:"JSON" help:"With --source: adapter config as JSON."`
@@ -161,25 +160,28 @@ type runCmd struct {
 	Host     string `placeholder:"H" help:"Run over ssh on this host (default local)."`
 	cmdOpts  `embed:""`
 	ownerOpt `embed:""`
-	Every    string        `placeholder:"${every}" help:"Notify with digests this often, from the job's first line (min 5s)."`
+	Every    string        `placeholder:"${every}" help:"Notify with digests at most this often, from the job's first line (min ${minEvery})."`
 	Match    string        `placeholder:"RE" help:"Notify only on lines matching this regex (default every ${every})."`
 	Until    string        `placeholder:"RE" help:"Block until a line matches (exit 0; 3 on timeout; 4 if the job ended). The job keeps running."`
 	Timeout  time.Duration `default:"30m" help:"With --until: give up after this long (exit 3)."`
 	Argv     []string      `arg:"" passthrough:"" placeholder:"CMD" help:"The command, after --. One argument is used verbatim as a shell command; several are shell-quoted and joined."`
 }
 
-// tool is tail_start for the command in Argv: one argument verbatim (so `run -- 'a | b'` works), several
-// shell-quoted and joined.
-func (c *runCmd) tool() (string, any) {
+// cmd is the command in Argv: one argument verbatim (so `run -- 'a | b'` works), several shell-quoted
+// and joined.
+func (c *runCmd) cmd() string {
 	argv := c.Argv
 	if len(argv) > 0 && argv[0] == "--" {
 		argv = argv[1:]
 	}
-	cmd := shellescape.QuoteCommand(argv)
 	if len(argv) == 1 {
-		cmd = argv[0]
+		return argv[0]
 	}
-	in := tools.StartIn{Caller: c.caller(), Cmd: cmd, Host: c.Host, Name: c.Name, NotifyEvery: c.Every, NotifyMatch: c.Match}
+	return shellescape.QuoteCommand(argv)
+}
+
+func (c *runCmd) tool() (string, any) {
+	in := tools.StartIn{Caller: c.caller(), Cmd: c.cmd(), Host: c.Host, Name: c.Name, NotifyEvery: c.Every, NotifyMatch: c.Match}
 	c.set(&in)
 	return "tail_start", in
 }
@@ -191,9 +193,15 @@ func (c *runCmd) wait(job string) tools.WaitIn {
 	return tools.WaitIn{Caller: c.caller(), Job: job, Until: c.Until, Timeout: c.Timeout.String(), After: &after}
 }
 
-func (c *runCmd) Run() error {
-	if _, err := regexp.Compile(c.Until); err != nil { // before starting, so a bad flag leaves no job
+func (c *runCmd) Run() error { // checks the wait first, so a bad flag leaves no job
+	if _, err := regexp.Compile(c.Until); err != nil {
 		return fmt.Errorf("--until: %w", err)
+	}
+	if c.Until != "" && c.Timeout <= 0 {
+		return fmt.Errorf("--timeout must be positive (got %s)", c.Timeout)
+	}
+	if strings.TrimSpace(c.cmd()) == "" {
+		return errors.New("run needs a command after --")
 	}
 	r, err := call(c.tool())
 	if err != nil || c.Until == "" {
@@ -231,7 +239,7 @@ type readCmd struct {
 	After    int64  `help:"Only lines with id > ID (exclusive cursor)." placeholder:"ID"`
 	Tail     int    `help:"Newest N lines." placeholder:"N"`
 	Grep     string `help:"Only lines matching this regex." placeholder:"RE"`
-	Limit    int    `help:"Max lines (default 200)." placeholder:"N"`
+	Limit    int    `help:"Max lines (default ${readLimit})." placeholder:"N"`
 	ownerOpt `embed:""`
 }
 
@@ -246,7 +254,7 @@ type searchCmd struct {
 	Job      string   `help:"Only this job (id, or name among --owner's jobs)."`
 	All      bool     `help:"Every owner's jobs, not just --owner's."`
 	Since    string   `help:"Only lines newer than this, e.g. 1h." placeholder:"D"`
-	Limit    int      `help:"Max lines (default 50)." placeholder:"N"`
+	Limit    int      `help:"Max lines (default ${searchLimit})." placeholder:"N"`
 	ownerOpt `embed:""`
 }
 
@@ -258,7 +266,7 @@ func (c *searchCmd) tool() (string, any) {
 
 type sqlCmd struct {
 	Query []string `arg:"" help:"One read-only SELECT (words are joined with spaces)."`
-	Limit int      `help:"Max rows (default 500)." placeholder:"N"`
+	Limit int      `help:"Max rows (default ${sqlLimit})." placeholder:"N"`
 }
 
 func (c *sqlCmd) Run() error { return runTool(c) }
@@ -283,7 +291,7 @@ func (c *waitCmd) tool() (string, any) {
 
 type notifyCmd struct {
 	Job      string `arg:"" help:"Job id or name."`
-	Every    string `placeholder:"${every}" help:"Digest interval (min 5s)."`
+	Every    string `placeholder:"${every}" help:"Minimum time between digests (min ${minEvery})."`
 	Match    string `help:"Only notify on lines matching this regex." placeholder:"RE"`
 	After    *int64 `help:"Start cursor (default: the job's current end; 0 = its first line)." placeholder:"ID"`
 	ownerOpt `embed:""`
@@ -299,7 +307,7 @@ func (c *notifyCmd) tool() (string, any) {
 
 type followCmd struct {
 	Job      string        `arg:"" help:"Job id or name."`
-	Every    time.Duration `default:"${every}" help:"Poll interval (min 5s)."`
+	Every    time.Duration `default:"${every}" help:"Minimum time between digests (min ${minEvery})."`
 	Match    string        `help:"Only digest lines matching this regex." placeholder:"RE"`
 	MaxLines int           `default:"${maxLines}" help:"Lines per digest."`
 	After    int64         `default:"-1" help:"Start cursor (-1 = the job's current end)." placeholder:"ID"`
@@ -309,7 +317,7 @@ type followCmd struct {
 }
 
 func (c *followCmd) Run() error {
-	sink, err := deliver.New(c.Deliver)
+	sink, err := deliver.New(c.Deliver, tools.More)
 	if err != nil {
 		return err
 	}

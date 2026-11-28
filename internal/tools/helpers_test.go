@@ -16,10 +16,11 @@ import (
 	"github.com/abhirup-dev/tail-mode/internal/testutil"
 )
 
-// TestMain clears T3CODE_THREAD_ID so no test can reach a real T3 thread, and so identity does not
+// TestMain clears the env identity so no test can reach a real T3 thread, and so identity does not
 // depend on where the tests run. Tests that set it also stub the notifier seam.
 func TestMain(m *testing.M) {
 	os.Unsetenv("T3CODE_THREAD_ID")
+	os.Unsetenv("TAIL_MODE_OWNER")
 	os.Exit(m.Run())
 }
 
@@ -38,13 +39,15 @@ func testStore(t *testing.T, lines ...string) *store.Store {
 	return s
 }
 
-// connect connects an MCP client to a server over in-memory transports. The handler reads
-// T3CODE_THREAD_ID when it is created, so set it before.
+// connect connects an MCP client to a server over in-memory transports. The handler reads the env
+// identity when it is created, so set it before.
 func connect(t *testing.T, s *store.Store, shared bool) *mcp.ClientSession {
 	t.Helper()
 	ctx := context.Background()
 	ct, st := mcp.NewInMemoryTransports()
-	ss, err := newServer(&handler{s: s, c: MCP, shared: shared, thread: EnvThread()}).Connect(ctx, st, nil)
+	h := newHandler(s, MCP)
+	h.shared = shared
+	ss, err := newServer(h).Connect(ctx, st, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

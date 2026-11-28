@@ -18,10 +18,11 @@ import (
 )
 
 // TestMain doubles as the detached children (proc.Detach re-execs this test binary): `_job <id>` job
-// workers and `follow …` notifiers. T3CODE_THREAD_ID is cleared so nothing here can reach a real
+// workers and `follow …` notifiers. The env identity is cleared so nothing here can reach a real
 // T3 thread, and so --owner defaults do not depend on where the tests run.
 func TestMain(m *testing.M) {
 	os.Unsetenv("T3CODE_THREAD_ID")
+	os.Unsetenv("TAIL_MODE_OWNER")
 	if len(os.Args) > 1 && (os.Args[1] == "_job" || os.Args[1] == "follow") {
 		if err := Run(os.Args[1:]); err != nil {
 			fmt.Fprintln(os.Stderr, "test child:", err)
@@ -89,7 +90,7 @@ func TestFlagsToToolArgs(t *testing.T) {
 }
 
 // Exit status: 0 ok; wait's follow.WaitTimeout and follow.WaitEnded; 1 for a tool error (stderr, or stdout
-// for the hidden tool command that Pi reads). run with a bad --until starts nothing.
+// for the hidden tool command that Pi reads). run with a bad --until or --timeout, or no command, starts nothing.
 func TestExitCodes(t *testing.T) {
 	s := testutil.Store(t)
 	testutil.LiveJob(t, s, store.Job{Name: "live"}, "booting", "ready")
@@ -106,6 +107,8 @@ func TestExitCodes(t *testing.T) {
 		{[]string{"wait", "ended", "--until", "nope"}, follow.WaitEnded, "wait: job ended without a line matching /nope/"},
 		{[]string{"read", "nosuch"}, 1, ""},
 		{[]string{"run", "--until", "(", "--", "true"}, -1, ""},
+		{[]string{"run", "--until", "x", "--timeout", "0s", "--", "true"}, -1, ""},
+		{[]string{"run", "--", " "}, -1, ""},
 		{[]string{"tool", "tail_read", `{"job":"nosuch"}`}, 1, `error: no job "nosuch"`},
 		{[]string{"tool", "tail_jobs", "--client", "pi"}, 0, `{"text":"count: 2 jobs`},
 	} {

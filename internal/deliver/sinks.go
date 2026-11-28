@@ -14,17 +14,17 @@ import (
 )
 
 // New builds a sink from a --deliver spec: "stdout" | "jsonl" | "t3:THREAD". The thread is always
-// explicit: resolving it from the environment is the integration layer's job.
-func New(spec string) (Sink, error) {
+// explicit: resolving it from the environment is the integration layer's job. more is passed to Text.
+func New(spec string, more More) (Sink, error) {
 	switch {
 	case spec == "" || spec == "stdout":
-		return writerSink{w: os.Stdout}, nil
+		return writerSink{w: os.Stdout, more: more}, nil
 	case spec == "jsonl":
-		return writerSink{w: os.Stdout, json: true}, nil
+		return writerSink{w: os.Stdout, json: true, more: more}, nil
 	case spec == "t3" || spec == "t3:":
 		return nil, fmt.Errorf("t3 sink: no thread (use t3:THREAD)")
 	case strings.HasPrefix(spec, "t3:"):
-		return t3Sink{thread: spec[len("t3:"):]}, nil
+		return t3Sink{thread: spec[len("t3:"):], more: more}, nil
 	}
 	return nil, fmt.Errorf("unknown sink %q (stdout|jsonl|t3:THREAD)", spec)
 }
@@ -32,6 +32,7 @@ func New(spec string) (Sink, error) {
 type writerSink struct {
 	w    io.Writer
 	json bool
+	more More
 }
 
 func (s writerSink) Deliver(_ context.Context, d Digest) error {
@@ -43,19 +44,22 @@ func (s writerSink) Deliver(_ context.Context, d Digest) error {
 		return json.NewEncoder(s.w).Encode(struct {
 			Digest
 			Text string `json:"text"`
-		}{d, Text(d)})
+		}{d, Text(d, s.more)})
 	}
-	_, err := io.WriteString(s.w, Text(d))
+	_, err := io.WriteString(s.w, Text(d, s.more))
 	return err
 }
 
-type t3Sink struct{ thread string }
+type t3Sink struct {
+	thread string
+	more   More
+}
 
 func (s t3Sink) Deliver(ctx context.Context, d Digest) error {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, t3Bin(), "thread", "send", s.thread, "-")
-	cmd.Stdin = strings.NewReader(Text(d))
+	cmd.Stdin = strings.NewReader(Text(d, s.more))
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {

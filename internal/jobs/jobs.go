@@ -28,6 +28,7 @@ var (
 	startingGrace = 10 * time.Second // an unlocked "starting" job is lost only after this
 	stopWait      = 3 * time.Second  // SIGTERM → SIGKILL
 	appendBudget  = 30 * time.Second // retry budget for one Append batch
+	flushBudget   = time.Second      // retry budget for a batch emitted while stopping
 	finishBudget  = 30 * time.Second // retry budget for the final status write
 	restartMin    = time.Second
 	restartMax    = 30 * time.Second
@@ -47,12 +48,10 @@ type StartOpts struct {
 	Cwd       string // caller's working dir for local defaults; "" = unknown (relative local paths refused)
 }
 
-func (o StartOpts) Local() bool { return o.Transport == "" || o.Transport == "local" }
-
 // Resolve applies source.LocalDefaults against o.Cwd to a local job (remote jobs keep the remote's
 // defaults). Start calls it, and the returned job's Spec is the resolved one.
 func (o StartOpts) Resolve() (StartOpts, error) {
-	if !o.Local() {
+	if o.Transport != "" && o.Transport != "local" {
 		return o, nil
 	}
 	var err error
@@ -160,7 +159,7 @@ func (e *NotOwnerError) Error() string {
 
 // Stop stops a job. A starting job is marked stopped (its worker's claim then fails and it exits).
 // A running job's worker is signalled only while it holds the lock (so the pid is ours):
-// SIGTERM, wait ≤ 3 s, then SIGKILL its process group.
+// SIGTERM, wait ≤ 3 s, then SIGKILL its process group; an error if it still holds the lock.
 // ref is resolved for owner (ids match any owner, names only owner's). A job of another non-empty
 // owner is refused unless force; jobs in the shared namespace (owner "") can be stopped by anyone.
 func Stop(s *store.Store, ref, owner string, force bool) (store.Job, error) {
@@ -188,7 +187,9 @@ func Stop(s *store.Store, ref, owner string, force bool) (store.Job, error) {
 	}
 	// shortcut: on SIGKILL the source child has its own process group and survives until its next write
 	// hits SIGPIPE; record the child's pgid if hung workers become common.
-	proc.Terminate(j.PID, s.JobLock(j.ID), true, stopWait)
+	if !proc.Terminate(j.PID, s.JobLock(j.ID), true, stopWait) {
+		return j, fmt.Errorf("job %s: worker pid %d did not stop", j.ID, j.PID)
+	}
 	// Non-force: keep a terminal status the worker wrote itself (stopped, or failed if it dropped lines).
 	if err := s.Finish(j.ID, "stopped", 0, "", false); err != nil {
 		return j, err
@@ -213,13 +214,14 @@ func Run(s *store.Store, id string) error {
 	return run(ctx, s, id)
 }
 
-// retryWrite retries a store write with backoff for up to budget (or until ctx ends).
-func retryWrite(ctx context.Context, budget time.Duration, what string, op func() error) error {
+// retryWrite retries a store write with backoff for up to budget. It is never cancelled: a stop must
+// still store the last lines and the final status.
+func retryWrite(budget time.Duration, what string, op func() error) error {
 	b := backoff.NewExponentialBackOff(
 		backoff.WithInitialInterval(100*time.Millisecond),
 		backoff.WithMaxInterval(5*time.Second),
 		backoff.WithMaxElapsedTime(budget))
-	return backoff.RetryNotify(op, backoff.WithContext(b, ctx), func(err error, d time.Duration) { retried(what, err, d) })
+	return backoff.RetryNotify(op, b, func(err error, d time.Duration) { retried(what, err, d) })
 }
 
 func run(ctx context.Context, s *store.Store, id string) error {
@@ -228,8 +230,7 @@ func run(ctx context.Context, s *store.Store, id string) error {
 		return err
 	}
 	finish := func(status string, code int, msg string) error {
-		// Not bound to ctx: the final status must be written even while stopping.
-		return retryWrite(context.Background(), finishBudget, "finish", func() error { return s.Finish(j.ID, status, code, msg, false) })
+		return retryWrite(finishBudget, "finish", func() error { return s.Finish(j.ID, status, code, msg, false) })
 	}
 	fail := func(err error) error {
 		return errors.Join(err, finish("failed", 0, err.Error()))
@@ -263,8 +264,11 @@ func run(ctx context.Context, s *store.Store, id string) error {
 		if appendErr != nil || len(lines) == 0 {
 			return
 		}
-		ts := store.NowMS()
-		if err := retryWrite(ctx, appendBudget, "append", func() error { return s.Append(j.ID, lines, ts) }); err != nil {
+		ts, budget := store.NowMS(), appendBudget
+		if ctx.Err() != nil {
+			budget = flushBudget
+		}
+		if err := retryWrite(budget, "append", func() error { return s.Append(j.ID, lines, ts) }); err != nil {
 			appendErr = fmt.Errorf("append failed, dropped %d line(s): %w", len(lines), err)
 			cancelSrc()
 		}

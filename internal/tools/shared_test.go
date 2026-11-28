@@ -99,5 +99,5 @@ func TestSharedModeValidation(t *testing.T) {
 	call(t, cs, "tail_start", map[string]any{"cmd": "make", "dir": "~/app"})
 	call(t, cs, "tail_start", map[string]any{"file": "~/x.log"})
 	has(t, "start", call(t, cs, "tail_start", map[string]any{"cmd": "make", "dir": "/abs"}), "owner: this T3 thread\n", "dir: /abs\n")
-	has(t, "jobs", call(t, cs, "tail_jobs", map[string]any{}), "count: 3 jobs for this thread")
+	has(t, "jobs", call(t, cs, "tail_jobs", map[string]any{}), "count: 3 jobs for this T3 thread")
 }

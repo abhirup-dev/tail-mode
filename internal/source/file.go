@@ -13,10 +13,10 @@ import (
 // FileConfig is the "file" adapter's config.
 type FileConfig struct {
 	Path    string `json:"path"`              // "~" / "~/x" = the home dir where the transport runs
-	Backlog *int   `json:"backlog,omitempty"` // lines of history on first start; nil → 50; ignored on resume
+	Backlog *int   `json:"backlog,omitempty"` // lines of history on first start; nil → DefaultBacklog; ignored on resume
 }
 
-const defaultBacklog = 50
+const DefaultBacklog = 50
 
 func init() {
 	Register("file", func(raw json.RawMessage) (Source, error) {
@@ -46,7 +46,7 @@ func (f file) Stream(ctx context.Context, t transport.Transport, resumed bool, e
 
 // argv is `tail -n N -F -- PATH`; a "~" path goes through sh so that $HOME is the target's.
 func (f file) argv(resumed bool) []string {
-	n := defaultBacklog
+	n := DefaultBacklog
 	if f.Backlog != nil {
 		n = *f.Backlog
 	}

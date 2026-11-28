@@ -34,14 +34,10 @@ func TestNotifierReplacement(t *testing.T) {
 		return pid
 	}
 	live := func() map[string]int {
-		ns, err := s.ListNotifiers(j.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
 		m := map[string]int{}
-		for _, n := range ns {
-			if proc.Locked(lock(n.Deliver)) {
-				m[n.Deliver] = n.PID
+		for _, d := range []string{"jsonl", "stdout"} {
+			if n, ok, _ := s.GetNotifier(j.ID, d); ok && proc.Locked(lock(d)) {
+				m[d] = n.PID
 			}
 		}
 		return m
@@ -65,7 +61,16 @@ func TestNotifierReplacement(t *testing.T) {
 		_ = syscall.Kill(p, syscall.SIGTERM) // both hold their locks (checked above)
 		testutil.WaitDead(t, p)
 	}
-	if ns, _ := s.ListNotifiers(j.ID); len(ns) != 0 {
-		t.Fatalf("rows left: %+v", ns)
+	for _, d := range []string{"jsonl", "stdout"} {
+		if n, ok, _ := s.GetNotifier(j.ID, d); ok {
+			t.Fatalf("row left: %+v", n)
+		}
+	}
+
+	// An ended job's notifier only sends the final digest and may unregister before it is seen: no stall.
+	ended := testutil.Job(t, s, store.Job{Status: "exited"}, "done")
+	began := time.Now()
+	if _, err := follow.StartNotifier(s, ended.ID, follow.Options{After: 0, Deliver: "jsonl"}); err != nil || time.Since(began) > 2*time.Second {
+		t.Fatalf("ended job: %v after %v", err, time.Since(began))
 	}
 }

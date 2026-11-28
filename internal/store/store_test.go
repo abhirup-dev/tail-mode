@@ -29,7 +29,10 @@ func TestStore(t *testing.T) {
 	if err := s.CreateJob(job("j000001", "web", "running")); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Append("j000001", []string{"ok one", "ERROR db timeout", "ok two", "ERROR again"}, NowMS()); err != nil {
+	if err := s.Append("j000001", []string{"ok one", "ERROR db timeout", "ok two"}, NowMS()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Append("j000001", []string{"ERROR again"}, NowMS()+1000); err != nil {
 		t.Fatal(err)
 	}
 	j, err := s.GetJob("web", "")
@@ -49,7 +52,7 @@ func TestStore(t *testing.T) {
 		t.Fatalf("grep tail: %+v", g)
 	}
 	jobs, _ := s.ListJobs("", true)
-	if len(jobs) != 1 || jobs[0].Lines != 4 {
+	if len(jobs) != 1 || jobs[0].Lines != 4 || jobs[0].LastID != all[3].ID || jobs[0].LastTS != all[3].TS {
 		t.Fatalf("list: %+v", jobs)
 	}
 }
@@ -62,14 +65,14 @@ func TestDriverWALAndFTS(t *testing.T) {
 	}
 	s.CreateJob(job("j1", "", "running"))
 	s.Append("j1", []string{"connection refused by upstream", "all good", "retrying connections"}, NowMS())
-	hits, err := s.Search(SearchQuery{Query: "connection"}) // porter stemming matches "connections" too
-	if err != nil || len(hits) != 2 {
-		t.Fatalf("search: %v %v", hits, err)
+	hits, literal, err := s.Search(SearchQuery{Query: "connection"}) // porter stemming matches "connections" too
+	if err != nil || literal != nil || len(hits) != 2 {
+		t.Fatalf("search: %v %v %v", hits, literal, err)
 	}
-	if hits, err := s.Search(SearchQuery{Query: `bad "syntax`}); err != nil || len(hits) != 0 {
-		t.Fatalf("search fallback: %v %v", hits, err)
+	if hits, literal, err := s.Search(SearchQuery{Query: "upstream-x OR"}); err != nil || literal == nil || len(hits) != 0 {
+		t.Fatalf("search fallback: %v %v %v", hits, literal, err)
 	}
-	if hits, err := s.Search(SearchQuery{Query: "upstream", Job: "nope"}); err != nil || len(hits) != 0 {
+	if hits, _, err := s.Search(SearchQuery{Query: "upstream", Job: "nope"}); err != nil || len(hits) != 0 {
 		t.Fatalf("job filter: %v %v", hits, err)
 	}
 }
@@ -125,7 +128,7 @@ func TestOwnersAndSearch(t *testing.T) {
 		{SearchQuery{Query: "hit", Owner: "a", Job: "j1"}, 2},
 		{SearchQuery{Query: "hit", All: true, SinceTS: NowMS() - time.Minute.Milliseconds()}, 3},
 	} {
-		if hits, err := s.Search(c.q); err != nil || len(hits) != c.want {
+		if hits, _, err := s.Search(c.q); err != nil || len(hits) != c.want {
 			t.Errorf("%+v: %d hits %v, want %d", c.q, len(hits), err, c.want)
 		}
 	}
@@ -147,11 +150,9 @@ func TestNotifiers(t *testing.T) {
 	if _, ok, err := s.GetNotifier("j1", "t3:x"); ok || err != nil {
 		t.Fatalf("deleted row still there: %v", err)
 	}
-	if ns, _ := s.ListNotifiers("j1"); len(ns) != 1 || ns[0].PID != 12 {
-		t.Fatalf("list j1 %+v", ns)
-	}
-	if ns, _ := s.ListNotifiers(""); len(ns) != 2 {
-		t.Fatalf("list all %+v", ns)
+	var n int
+	if s.db.QueryRow(`SELECT COUNT(*) FROM notifiers`).Scan(&n); n != 2 {
+		t.Fatalf("%d rows, want 2", n)
 	}
 }
 

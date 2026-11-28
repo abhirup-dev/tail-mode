@@ -27,6 +27,12 @@ func init() { sqlite3.AutoExtension(fts5.Register) }
 
 const MaxLineBytes = 8 << 10
 
+// Default limits (a zero Limit means these), also stated in the tools' params.
+const (
+	ReadLimit   = 200
+	SearchLimit = 50
+)
+
 // DBFile is the database file name inside the state dir.
 const DBFile = "tail-mode.db"
 
@@ -93,18 +99,24 @@ CREATE TABLE IF NOT EXISTS notifiers(job TEXT NOT NULL, deliver TEXT NOT NULL, p
   PRIMARY KEY(job, deliver));
 `
 
-// postMigrate runs after migrate, since it needs columns that old DBs only get there.
-const postMigrate = `CREATE INDEX IF NOT EXISTS jobs_owner_name ON jobs(owner, name, started_at);`
+// schemaVersion is PRAGMA user_version once migrate has run; older DBs (any version before it) are 0.
+const schemaVersion = 1
 
-// migrate brings a DB created by an older version up to date. Every process opens the DB, so the
-// check and the ALTER run in one IMMEDIATE transaction: concurrent openers serialize, and the loser
-// sees the column and does nothing.
+// migrate brings the DB to schemaVersion. Every process opens the DB, so a current one costs a single
+// read; otherwise the idempotent upgrade runs in one IMMEDIATE transaction (concurrent openers serialize).
 func migrate(db *sql.DB) error {
+	var v int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil || v >= schemaVersion {
+		return err
+	}
 	tx, err := db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	if _, err := tx.Exec(schema); err != nil {
+		return err
+	}
 	var n int
 	if err := tx.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('jobs') WHERE name='owner'`).Scan(&n); err != nil {
 		return err
@@ -113,6 +125,9 @@ func migrate(db *sql.DB) error {
 		if _, err := tx.Exec(`ALTER TABLE jobs ADD COLUMN owner TEXT NOT NULL DEFAULT ''`); err != nil {
 			return err
 		}
+	}
+	if _, err := tx.Exec(fmt.Sprintf(`CREATE INDEX IF NOT EXISTS jobs_owner_name ON jobs(owner, name, started_at); PRAGMA user_version=%d;`, schemaVersion)); err != nil {
+		return err
 	}
 	return tx.Commit()
 }
@@ -133,15 +148,7 @@ func Open(dir string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := db.Exec(schema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("init schema: %w", err)
-	}
 	if err := migrate(db); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("migrate: %w", err)
-	}
-	if _, err := db.Exec(postMigrate); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("init schema: %w", err)
 	}
@@ -232,22 +239,21 @@ func (s *Store) GetJob(ref, owner string) (Job, error) {
 // ListJobs returns owner's jobs (all owners' if all), newest first, with line stats. It does not check
 // pid liveness (jobs.List does).
 func (s *Store) ListJobs(owner string, all bool) ([]Job, error) {
-	rows, err := s.db.Query(`SELECT `+jobCols+` FROM jobs WHERE ? OR owner=? ORDER BY started_at DESC, rowid DESC`, all, owner)
+	// A bare l.ts next to MAX(l.id) is SQLite's: it comes from the row with the max id.
+	rows, err := s.db.Query(`SELECT j.`+strings.ReplaceAll(jobCols, ",", ",j.")+`, COUNT(l.id), COALESCE(MAX(l.id),0), COALESCE(l.ts,0)
+		FROM jobs j LEFT JOIN lines l ON l.job=j.id WHERE ? OR j.owner=? GROUP BY j.id ORDER BY j.started_at DESC, j.rowid DESC`, all, owner)
 	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
 	var out []Job
 	for rows.Next() {
-		j, err := scanJob(rows)
-		if err != nil {
-			rows.Close()
+		var j Job
+		if err := rows.Scan(&j.ID, &j.Name, &j.Owner, &j.Kind, &j.Transport, &j.Target, &j.Spec, &j.Describe, &j.PID, &j.Status,
+			&j.StartedAt, &j.EndedAt, &j.ExitCode, &j.Error, &j.Lines, &j.LastID, &j.LastTS); err != nil {
 			return nil, err
 		}
 		out = append(out, j)
-	}
-	rows.Close()
-	for i := range out {
-		_ = s.Stats(&out[i])
 	}
 	return out, rows.Err()
 }
@@ -316,13 +322,13 @@ type ReadQuery struct {
 	After int64          // exclusive cursor
 	Tail  int            // >0: the newest Tail lines after After (returned oldest first)
 	Grep  *regexp.Regexp // optional filter
-	Limit int            // max lines returned (default 200)
+	Limit int            // max lines returned (default ReadLimit)
 }
 
 // Read returns lines oldest first. With Grep, it scans forward until Limit matches.
 func (s *Store) Read(q ReadQuery) ([]Line, error) {
 	if q.Limit <= 0 {
-		q.Limit = 200
+		q.Limit = ReadLimit
 	}
 	var rows *sql.Rows
 	var err error
@@ -353,18 +359,19 @@ func (s *Store) Read(q ReadQuery) ([]Line, error) {
 }
 
 type SearchQuery struct {
-	Query   string // FTS5 query; falls back to a quoted phrase if the syntax is invalid
+	Query   string // FTS5 query; see Search for invalid syntax
 	Job     string // optional job id; when set, Owner/All are ignored
 	Owner   string // only jobs of this owner, unless All
 	All     bool
 	SinceTS int64 // optional, unix ms
-	Limit   int   // default 50
+	Limit   int   // default SearchLimit
 }
 
-// Search returns FTS matches newest first.
-func (s *Store) Search(q SearchQuery) ([]Line, error) {
+// Search returns FTS matches newest first. A query FTS5 rejects (weak agents send CUSTOM-ALERT or
+// E1234:) is searched as a literal phrase instead, and literal is why.
+func (s *Store) Search(q SearchQuery) (lines []Line, literal, err error) {
 	if q.Limit <= 0 {
-		q.Limit = 50
+		q.Limit = SearchLimit
 	}
 	run := func(match string) ([]Line, error) {
 		rows, err := s.db.Query(`SELECT l.id,l.job,l.ts,l.text FROM lines_fts f JOIN lines l ON l.id=f.rowid
@@ -376,13 +383,13 @@ func (s *Store) Search(q SearchQuery) ([]Line, error) {
 		}
 		return scanLines(rows, nil, 0)
 	}
-	out, err := run(q.Query)
-	if err != nil { // most likely FTS5 syntax: retry as a literal phrase
-		if out2, err2 := run(`"` + strings.ReplaceAll(q.Query, `"`, `""`) + `"`); err2 == nil {
-			return out2, nil
-		}
+	if lines, err = run(q.Query); err == nil {
+		return lines, nil, nil
 	}
-	return out, err
+	if lines, err2 := run(`"` + strings.ReplaceAll(q.Query, `"`, `""`) + `"`); err2 == nil {
+		return lines, err, nil
+	}
+	return nil, nil, err
 }
 
 // Notifier is a registered detached follower: one per (job, deliver), see follow.StartNotifier.
@@ -414,23 +421,4 @@ func (s *Store) GetNotifier(job, deliver string) (n Notifier, ok bool, err error
 		return n, false, nil
 	}
 	return n, err == nil, err
-}
-
-// ListNotifiers returns job's notifier rows ("" = all jobs). Rows of dead followers may linger until
-// replaced; check liveness with the notifier lock.
-func (s *Store) ListNotifiers(job string) ([]Notifier, error) {
-	rows, err := s.db.Query(`SELECT job,deliver,pid,started_at FROM notifiers WHERE ?='' OR job=? ORDER BY job, deliver`, job, job)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []Notifier
-	for rows.Next() {
-		var n Notifier
-		if err := rows.Scan(&n.Job, &n.Deliver, &n.PID, &n.StartedAt); err != nil {
-			return nil, err
-		}
-		out = append(out, n)
-	}
-	return out, rows.Err()
 }

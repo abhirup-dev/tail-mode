@@ -3,10 +3,13 @@ package transport
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"os/exec"
 	"slices"
+	"strings"
+	"unicode"
 
 	"al.essio.dev/pkg/shellescape"
 )
@@ -43,3 +46,15 @@ func Names() []string {
 
 // Quote quotes s as one word for a POSIX shell.
 func Quote(s string) string { return shellescape.Quote(s) }
+
+// CheckWord rejects a value that must stay one argv word and never parse as an option: one that starts
+// with '-' or contains whitespace or control characters.
+func CheckWord(s string) error {
+	switch {
+	case strings.HasPrefix(s, "-"):
+		return errors.New("starts with '-'")
+	case strings.IndexFunc(s, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0:
+		return errors.New("contains whitespace or control characters")
+	}
+	return nil
+}

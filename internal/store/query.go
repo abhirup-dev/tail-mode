@@ -11,8 +11,11 @@ import (
 	"github.com/ncruces/go-sqlite3"
 )
 
-// DefaultQueryTimeout bounds Query when ctx has no deadline.
-const DefaultQueryTimeout = 5 * time.Second
+// Query's limits: the default row limit and the time cap.
+const (
+	QueryLimit   = 500
+	QueryTimeout = 5 * time.Second
+)
 
 // readPragmas may take an argument (a table or index name); any other pragma is allowed only bare.
 var readPragmas = map[string]bool{
@@ -45,17 +48,14 @@ func authorize(action sqlite3.AuthorizerActionCode, name3rd, name4th, _, _ strin
 }
 
 // Query runs one agent-supplied read-only statement on its own read-only connection and returns the
-// column names and at most limit rows (≤0 → 500). It stops at ctx's deadline (DefaultQueryTimeout if
-// none) by interrupting SQLite, and never steps past the row budget.
+// column names and at most limit rows (≤0 → QueryLimit). It stops at ctx's deadline or after
+// QueryTimeout, whichever is first, by interrupting SQLite, and never steps past the row budget.
 func (s *Store) Query(ctx context.Context, query string, limit int) (cols []string, rows [][]any, err error) {
 	if limit <= 0 {
-		limit = 500
+		limit = QueryLimit
 	}
-	if _, ok := ctx.Deadline(); !ok {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, DefaultQueryTimeout)
-		defer cancel()
-	}
+	ctx, cancel := context.WithTimeout(ctx, QueryTimeout)
+	defer cancel()
 	u := url.URL{Scheme: "file", Path: s.Path(),
 		RawQuery: "mode=ro&_pragma=busy_timeout(5000)&_pragma=query_only(1)"}
 	conn, err := sqlite3.OpenFlags(u.String(), sqlite3.OPEN_READONLY|sqlite3.OPEN_URI)

@@ -29,10 +29,10 @@ const (
 	WaitEnded       = 4
 )
 
-// Test knobs.
+// MinEvery is the smallest Options.Every; it and pollEvery are test knobs.
 var (
-	minEvery  = 5 * time.Second
-	waitEvery = time.Second
+	MinEvery  = 5 * time.Second
+	pollEvery = time.Second // how often Follow and WaitCursor look for news
 	// registerWait is how long StartNotifier waits for the new follower to take over (its lock retry is 2 s).
 	registerWait = 4 * time.Second
 	stopWait     = 3 * time.Second // SIGTERM → SIGKILL for a replaced follower
@@ -68,10 +68,11 @@ func startCursor(s *store.Store, job string, after int64) (int64, error) {
 	return s.MaxID(job)
 }
 
-// Follow polls job every o.Every and delivers a digest per tick with news; on job end it delivers a
-// final digest (retried, see finalRetry) and returns nil. Returns ctx.Err() on cancel. A failed
-// non-final delivery keeps the accumulated news for the next tick.
-// o is validated first (Validate); o.Deliver is ignored (the caller built sink).
+// Follow polls job every pollEvery and delivers a digest as soon as there is news (a match when
+// o.Match is set, else any line) and o.Every has passed since the previous attempt: o.Every is the
+// minimum gap, and the first news goes out at once. On job end it delivers a final digest (retried,
+// see finalRetry) and returns nil. Returns ctx.Err() on cancel. A failed non-final delivery keeps the
+// news for the next attempt. o is validated first (Validate); o.Deliver is ignored (the caller built sink).
 func Follow(ctx context.Context, s *store.Store, job store.Job, o Options, sink deliver.Sink) error {
 	if err := o.Validate(); err != nil {
 		return err
@@ -87,8 +88,9 @@ func Follow(ctx context.Context, s *store.Store, job store.Job, o Options, sink 
 	from := cursor
 	var newN, matched int
 	var keep []deliver.Line // last MaxLines candidates since from
+	var last time.Time      // previous delivery attempt
 
-	t := time.NewTicker(o.Every)
+	t := time.NewTicker(pollEvery)
 	defer t.Stop()
 	for {
 		running, err := liveStatus(s, &job) // check before reading so lines written before the end are seen
@@ -125,26 +127,24 @@ func Follow(ctx context.Context, s *store.Store, job store.Job, o Options, sink 
 				}
 			}
 		}
-		if newN > 0 && (match == nil || matched > 0) || !running {
-			d := deliver.Digest{Job: job.ID, Name: job.Name, Host: job.Target, Status: job.Status,
-				New: newN, Matched: matched, From: from, To: cursor, Final: !running, Lines: keep, Match: o.Match}
-			if !running {
-				if job.Status == "exited" {
-					code := job.ExitCode
-					d.ExitCode = &code
-				}
-				d.Error = job.Error
-				finalSummary(s, job, match, &d)
-				return deliverFinal(ctx, sink, d)
+		d := deliver.Digest{Job: job.ID, Name: job.Name, Host: job.Target, Status: job.Status,
+			New: newN, Matched: matched, From: from, To: cursor, Final: !running, Lines: keep, Match: o.Match}
+		if !running {
+			if job.Status == "exited" {
+				code := job.ExitCode
+				d.ExitCode = &code
 			}
+			d.Error = job.Error
+			finalSummary(s, job, match, &d)
+			return deliverFinal(ctx, sink, d)
+		}
+		if newN > 0 && (match == nil || matched > 0) && time.Since(last) >= o.Every {
+			last = time.Now()
 			if err := sink.Deliver(ctx, d); err != nil {
-				fmt.Fprintln(os.Stderr, "tail-mode follow: deliver:", err) // keep going; next tick retries with new news
+				fmt.Fprintln(os.Stderr, "tail-mode follow: deliver:", err) // keep going; the next attempt has the news too
 			} else {
 				from, newN, matched, keep = cursor, 0, 0, nil
 			}
-		}
-		if !running {
-			return nil
 		}
 		select {
 		case <-ctx.Done():
@@ -201,7 +201,7 @@ func WaitCursor(ctx context.Context, s *store.Store, job store.Job, until *regex
 		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
 	}
-	t := time.NewTicker(waitEvery)
+	t := time.NewTicker(pollEvery)
 	defer t.Stop()
 	for {
 		running, err := liveStatus(s, &job)
@@ -247,7 +247,7 @@ type Options struct {
 }
 
 // Validate fills in the defaults (so callers report effective values), then rejects an interval below
-// 5s, a negative MaxLines and a bad Match regex. It is the only check of these rules.
+// MinEvery, a negative MaxLines and a bad Match regex. It is the only check of these rules.
 func (o *Options) Validate() error {
 	if o.Every == 0 {
 		o.Every = DefaultEvery
@@ -255,8 +255,8 @@ func (o *Options) Validate() error {
 	if o.MaxLines == 0 {
 		o.MaxLines = DefaultMaxLines
 	}
-	if o.Every < minEvery {
-		return fmt.Errorf("every must be ≥ %s (got %s)", minEvery, o.Every)
+	if o.Every < MinEvery {
+		return fmt.Errorf("every must be ≥ %s (got %s)", MinEvery, o.Every)
 	}
 	if o.MaxLines < 0 {
 		return fmt.Errorf("max lines must be positive (got %d)", o.MaxLines)
@@ -311,12 +311,13 @@ func stopNotifier(s *store.Store, job, deliver string) error {
 
 // StartNotifier makes a detached `tail-mode follow` process the one notifier for (job, o.Deliver):
 // a live follower for the same job and destination is stopped first (followers for other
-// destinations are left alone). It returns once the new follower has registered, with its pid.
+// destinations are left alone). It returns once the new follower has registered, or at once if the
+// job has ended (the follower then only sends the final digest and may unregister before it is seen).
 func StartNotifier(s *store.Store, job string, o Options) (int, error) {
 	if o.Deliver == "" {
 		return 0, errors.New("notifier: no deliver spec")
 	}
-	if _, err := deliver.New(o.Deliver); err != nil {
+	if _, err := deliver.New(o.Deliver, nil); err != nil {
 		return 0, err
 	}
 	if err := o.Validate(); err != nil {
@@ -334,7 +335,7 @@ func StartNotifier(s *store.Store, job string, o Options) (int, error) {
 		if err != nil {
 			return pid, err
 		}
-		if ok && n.PID == pid {
+		if running, err := liveStatus(s, &store.Job{ID: job}); ok && n.PID == pid || err == nil && !running {
 			return pid, nil
 		}
 		if time.Now().After(end) {

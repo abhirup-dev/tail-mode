@@ -32,8 +32,8 @@ const (
 //
 // The stream ends when the leader exits, not at pipe EOF, so a backgrounded descendant holding stdout
 // cannot keep it alive: output is drained for up to drainAfter, then the group is killed and the leader's
-// status returned (an error wrapping *exec.ExitError if non-zero). ctx cancel kills the group and
-// returns ctx.Err().
+// status returned (an error wrapping *exec.ExitError if non-zero). ctx cancel sends the group SIGTERM,
+// keeps reading for up to drainAfter (so shutdown output is kept), then kills it; it returns ctx.Err().
 func stream(ctx context.Context, t transport.Transport, argv []string, emit func([]string)) error {
 	inR, inW, err := os.Pipe()
 	if err != nil {
@@ -49,7 +49,7 @@ func stream(ctx context.Context, t transport.Transport, argv []string, emit func
 
 	cmd := t.Command(ctx, argv...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error { return killGroup(cmd.Process.Pid) }
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM) }
 	if cmd.Stdin == nil { // the transport wants a held-open stdin (ssh: remote cleanup keys off its EOF)
 		cmd.Stdin = inR
 	}
@@ -103,13 +103,17 @@ func stream(ctx context.Context, t transport.Transport, argv []string, emit func
 			flush()
 		case waitErr = <-exited:
 			leaderDone, exited = true, nil
-			drain = time.After(drainAfter)
+			if drain == nil {
+				drain = time.After(drainAfter)
+			}
 		case <-drain:
 			drain = nil
 			stopReading()
-		case <-done:
+		case <-done: // cmd.Cancel sent SIGTERM; the grace is the same drain
 			done = nil
-			stopReading()
+			if drain == nil {
+				drain = time.After(drainAfter)
+			}
 		}
 	}
 	flush()

@@ -14,6 +14,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/abhirup-dev/tail-mode/internal/deliver"
 	"github.com/abhirup-dev/tail-mode/internal/follow"
 	"github.com/abhirup-dev/tail-mode/internal/store"
 	"github.com/abhirup-dev/tail-mode/internal/testutil"
@@ -33,7 +34,7 @@ func has(t *testing.T, what, out string, want ...string) {
 // job rows; multi-line text kept on one row; empty results say so.
 func TestShapes(t *testing.T) {
 	s := testStore(t)
-	j := testutil.Job(t, s, store.Job{Name: "multi", Describe: "echo a\necho b"})
+	j := testutil.Job(t, s, store.Job{Name: "multi", Describe: "echo a ⏎ echo b"}) // as jobs.Start stores a multi-line cmd
 	if err := s.Finish(j.ID, "failed", 0, "boom\nmore", true); err != nil {
 		t.Fatal(err)
 	}
@@ -43,12 +44,12 @@ func TestShapes(t *testing.T) {
 		args map[string]any
 		want []string
 	}{
-		{"tail_read", map[string]any{"job": "web", "grep": "ERROR"}, []string{dataNote + "\njob: j000001 (web) · exited 3 · 3 lines total · last output ",
+		{"tail_read", map[string]any{"job": "web", "grep": "ERROR"}, []string{deliver.DataNote + "\njob: j000001 (web) · exited 3 · 3 lines total · last output ",
 			"\nlines[1]{id,time,text}:\n  2,", ",ERROR db timeout\ncursor: 2\n"}},
 		{"tail_read", map[string]any{"job": "web", "after": 3}, []string{"lines: 0 new lines after cursor 3\ncursor: 3\n"}},
-		{"tail_search", map[string]any{"query": "timeout", "since": "1h"}, []string{dataNote, "count: 1 match for 'timeout'", "lines[1]{id,job,time,text}:\n  2,j000001,"}},
+		{"tail_search", map[string]any{"query": "timeout", "since": "1h"}, []string{deliver.DataNote, "count: 1 match for 'timeout'", "lines[1]{id,job,time,text}:\n  2,j000001,"}},
 		{"tail_search", map[string]any{"query": "zzz"}, []string{"lines: 0 matches for 'zzz' in ", "help[2]:"}},
-		{"tail_sql", map[string]any{"query": "select count(*) n, 'a,b' s from lines"}, []string{dataNote + "\nrows[1]{n,s}:\n  3,\"a,b\"\ncount: 1 rows\n"}},
+		{"tail_sql", map[string]any{"query": "select count(*) n, 'a,b' s from lines"}, []string{deliver.DataNote + "\nrows[1]{n,s}:\n  3,\"a,b\"\ncount: 1 rows\n"}},
 		{"tail_sql", map[string]any{"query": "select a.id, b.id from jobs a, jobs b where a.id=b.id"}, []string{"rows[2]{id,id_2}:"}},
 		{"tail_sql", map[string]any{"query": "select id from jobs where 0"}, []string{"rows: 0 rows\ncolumns[1]: id\n"}},
 		{"tail_jobs", map[string]any{}, []string{"count: 2 jobs for the shared namespace", "jobs[2]{id,name,status,lines,last_output,source}:\n",
@@ -75,7 +76,7 @@ func TestOutputBudget(t *testing.T) {
 	cs := client(t, testStore(t, long...))
 
 	out := call(t, cs, "tail_read", map[string]any{"job": "web", "limit": 500})
-	if len(out) > maxOut || !strings.HasPrefix(out, dataNote) {
+	if len(out) > maxOut || !strings.HasPrefix(out, deliver.DataNote) {
 		t.Fatalf("len %d, head %q", len(out), out[:60])
 	}
 	rows := rowRe.FindAllStringSubmatch(out, -1)
@@ -87,13 +88,13 @@ func TestOutputBudget(t *testing.T) {
 
 	out = call(t, cs, "tail_search", map[string]any{"query": "line", "limit": 300})
 	rows = rowRe.FindAllStringSubmatch(out, -1)
-	if len(out) > maxOut || !strings.HasPrefix(out, dataNote) || !strings.Contains(out, fmt.Sprintf("down to id %s ", rows[len(rows)-1][1])) ||
+	if len(out) > maxOut || !strings.HasPrefix(out, deliver.DataNote) || !strings.Contains(out, fmt.Sprintf("down to id %s ", rows[len(rows)-1][1])) ||
 		!strings.Contains(out, fmt.Sprintf("\nlines[%d]{", len(rows))) {
 		t.Fatalf("search: len %d\n%s", len(out), out[len(out)-200:])
 	}
 
 	out = call(t, cs, "tail_sql", map[string]any{"query": "select id, text from lines"})
-	if len(out) > maxOut || !strings.HasPrefix(out, dataNote+"\nrows[") || !strings.Contains(out, " of 300 rows shown (output budget); narrow the query") {
+	if len(out) > maxOut || !strings.HasPrefix(out, deliver.DataNote+"\nrows[") || !strings.Contains(out, " of 300 rows shown (output budget); narrow the query") {
 		t.Fatalf("sql: len %d\n%s", len(out), out[len(out)-200:])
 	}
 }
@@ -101,8 +102,8 @@ func TestOutputBudget(t *testing.T) {
 func TestRenderOversizedRow(t *testing.T) {
 	row := strings.Repeat("é", maxOut) // 2 bytes per rune: a byte cut would split one
 	tb := table{key: "lines", head: "{text}:", rows: []string{"  " + row, "  next"}}
-	out := render(dataNote+"\n", tb, func(n int) string { return "shown " + strconv.Itoa(n) + "\n" })
-	if len(out) > maxOut || !utf8.ValidString(out) || !strings.HasPrefix(out, dataNote+"\nlines[1]{text}:\n") || !strings.HasSuffix(out, "…\nshown 1\n") {
+	out := render(deliver.DataNote+"\n", tb, func(n int) string { return "shown " + strconv.Itoa(n) + "\n" })
+	if len(out) > maxOut || !utf8.ValidString(out) || !strings.HasPrefix(out, deliver.DataNote+"\nlines[1]{text}:\n") || !strings.HasSuffix(out, "…\nshown 1\n") {
 		t.Fatalf("len %d, tail %q", len(out), out[len(out)-40:])
 	}
 }
@@ -111,9 +112,8 @@ var cliMention = regexp.MustCompile("`?tail-mode (run|start|stop|jobs|read|searc
 
 // The schemas: identity never comes from params (no thread), MCP takes only host (no transport/target),
 // every tool takes owner, unknown params are refused; descriptions carry the guidance and name only
-// tools. `tail-mode tool --list` (List) is exactly what MCP advertises.
+// tools, with ${vars} expanded. `tail-mode tool --list` (List) is what a non-shared MCP server advertises.
 func TestSchemas(t *testing.T) {
-	t.Setenv("TAIL_MODE_SHARED", "1") // for List
 	cs := connect(t, testStore(t), true)
 	res, err := cs.ListTools(context.Background(), nil)
 	if err != nil {
@@ -131,7 +131,7 @@ func TestSchemas(t *testing.T) {
 			t.Errorf("%s params: %v", tool.Name, slices.Sorted(maps.Keys(schema.Properties)))
 		}
 		d, _ := json.Marshal(tool)
-		if m := cliMention.FindString(string(d)); m != "" || strings.Contains(string(d), "T3CODE_THREAD_ID") {
+		if m := cliMention.FindString(string(d)); m != "" || strings.Contains(string(d), "T3CODE_THREAD_ID") || strings.Contains(string(d), "${") {
 			t.Errorf("%s mentions the CLI or the thread env (%q): %s", tool.Name, m, tool.Description)
 		}
 		switch tool.Name {
@@ -150,6 +150,9 @@ func TestSchemas(t *testing.T) {
 		_ = json.Unmarshal(b, &x)
 		b, _ = json.Marshal(x)
 		return string(b)
+	}
+	if res, err = client(t, testStore(t)).ListTools(context.Background(), nil); err != nil {
+		t.Fatal(err)
 	}
 	if got, want := canon(List()), canon(res.Tools); got != want {
 		t.Errorf("List:\n%s\nMCP:\n%s", got, want)
@@ -176,7 +179,8 @@ func TestBadInput(t *testing.T) {
 		{"tail_start", map[string]any{"cmd": "x", "dir": "/x", "notify_every": "1s"}, "5s"},
 		{"tail_wait", map[string]any{"job": "web", "until": "x", "timeout": "10m"}, "over the 5m0s maximum"},
 		{"tail_wait", map[string]any{"job": "web", "until": "x", "timeout": "soon"}, "is not a positive duration"},
-		{"tail_wait", map[string]any{"job": "web", "until": "("}, "non-empty regex"},
+		{"tail_wait", map[string]any{"job": "web", "until": "("}, "not a valid regex"},
+		{"tail_wait", map[string]any{"job": "web", "until": ""}, "until is empty"},
 		{"tail_read", map[string]any{"job": "web", "grep": "("}, "grep"},
 		{"tail_search", map[string]any{"query": "x", "since": "soon"}, "since"},
 	} {
@@ -201,8 +205,11 @@ func TestIdentityFromEnv(t *testing.T) {
 	if cwd, _ := os.Getwd(); last().Owner != "thread-1" || last().Cwd != cwd {
 		t.Errorf("start %+v", last())
 	}
-	has(t, "start in T3", out, "owner: this T3 thread\n", "notifications: off; tail_notify sends digests → this T3 thread thread-1 (detected from your session")
-	has(t, "jobs in T3", call(t, cs, "tail_jobs", map[string]any{}), "count: 1 job for this thread")
+	has(t, "start in T3", out, "owner: this T3 thread\n", "notifications: off; tail_notify sends digests → this T3 thread (detected from your session")
+	if strings.Contains(out, "thread-1") {
+		t.Errorf("shows the thread id:\n%s", out)
+	}
+	has(t, "jobs in T3", call(t, cs, "tail_jobs", map[string]any{}), "count: 1 job for this T3 thread")
 
 	t.Setenv("T3CODE_THREAD_ID", "")
 	cs = client(t, testStore(t))
@@ -221,7 +228,8 @@ func TestIdentityFromEnv(t *testing.T) {
 }
 
 // With push (a T3 thread), notifying starts one notifier for the thread (tail_start's from the job's
-// first line, tail_notify's from now unless after) and tells the agent to end its turn, never to wait.
+// first line, tail_notify's from now unless after) and tells the agent to end its turn, never to wait,
+// and that the notifier persists (re-arming it duplicates digests); replacement is not news to a fresh start.
 func TestNotifyOn(t *testing.T) {
 	_, notes := fakes(t)
 	t.Setenv("T3CODE_THREAD_ID", "thread-1")
@@ -239,8 +247,9 @@ func TestNotifyOn(t *testing.T) {
 		{"tail_notify", map[string]any{"job": "j000001", "after": 2, "match": "E"}, 2, 30 * time.Second, "E"},
 	} {
 		out := call(t, cs, c.tool, c.args)
-		has(t, fmt.Sprint(c.tool, c.args), out, "notifications: on → this T3 thread thread-1", "End your turn now")
-		if strings.Contains(out, "tail_wait") {
+		has(t, fmt.Sprint(c.tool, c.args), out, "notifications: on → this T3 thread", "End your turn now",
+			"The notifier keeps running until the job ends — do not call tail_notify again.")
+		if strings.Contains(out, "tail_wait") || strings.Contains(out, "replace") {
 			t.Errorf("%s %v suggests waiting:\n%s", c.tool, c.args, out)
 		}
 		if ns := notes(); len(ns) != i+1 || ns[i].Deliver != "t3:thread-1" || ns[i].After != c.after || ns[i].Every != c.every || ns[i].Match != c.match {
@@ -252,11 +261,18 @@ func TestNotifyOn(t *testing.T) {
 	}
 }
 
-// A client that delivers digests itself (Pi) gets the follower to run, not a T3 notifier or the recipe.
-func TestPiNotify(t *testing.T) {
-	_, notes := fakes(t)
-	h := &handler{s: testStore(t), c: Pi}
-	r, err := h.exec(context.Background(), "tail_notify", []byte(`{"job":"web","match":"ERR"}`))
+// Pi: the extension's TAIL_MODE_OWNER is the owner, shown as this Pi session (no warning, owner param
+// ignored), and notifying hands back the follower to run, not a T3 notifier or the recipe.
+func TestPi(t *testing.T) {
+	last, notes := fakes(t)
+	t.Setenv("TAIL_MODE_OWNER", "pi:s1")
+	h := newHandler(testStore(t), Pi)
+	r, err := h.exec(context.Background(), "tail_start", []byte(`{"cmd":"make","owner":"x"}`))
+	if err != nil || last().Owner != "pi:s1" || strings.Contains(r.Text, "warning") {
+		t.Fatalf("%v %+v\n%s", err, last(), r.Text)
+	}
+	has(t, "pi start", r.Text, "owner: this Pi session\n")
+	r, err = h.exec(context.Background(), "tail_notify", []byte(`{"job":"j000001","match":"ERR"}`))
 	want := []string{"follow", "--deliver=jsonl", "--after=-1", "--every=30s", "--max-lines=10", "--match=ERR", "--", "j000001"}
 	if err != nil || r.Follow == nil || r.Follow.Job != "j000001" || !slices.Equal(r.Follow.Argv, want) || len(notes()) != 0 {
 		t.Fatalf("%v %+v\n%s", err, r.Follow, r.Text)
@@ -289,7 +305,7 @@ func TestWait(t *testing.T) {
 	testutil.Job(t, s, store.Job{ID: "j000004", Name: "srv"}, "booting", "listening on :3000") // starting: live in its grace period
 	cs := client(t, s)
 	has(t, "match", call(t, cs, "tail_wait", map[string]any{"job": "srv", "until": "listening"}),
-		dataNote+"\nwait: matched /listening/ in job j000004 (srv)\nlines[1]{id,time,text}:\n  5,", "cursor: 5\n")
+		deliver.DataNote+"\nwait: matched /listening/ in job j000004 (srv)\nlines[1]{id,time,text}:\n  5,", "cursor: 5\n")
 	has(t, "timeout", call(t, cs, "tail_wait", map[string]any{"job": "srv", "until": "ready", "timeout": "100ms"}),
 		"wait: timed out after 100ms; no line matched /ready/", "last_lines[2]{id,time,text}:", "cursor: 5\n",
 		`tail_wait job=j000004 until="ready" after=5 keeps waiting`, "tail_notify job=j000004")
@@ -310,8 +326,7 @@ func TestStartHost(t *testing.T) {
 }
 
 // Exec (`tail-mode tool`, the CLI) runs the same handlers as MCP: the same text. Only the Client
-// differs: the CLI's owner param wins over the env thread, shared mode does not apply to its cwd, and its
-// waits have no cap and report the exit code.
+// differs: the CLI's owner param wins over the env thread, and its waits have no cap and report the exit code.
 func TestExec(t *testing.T) {
 	fakes(t)
 	cs := client(t, testStore(t))
@@ -339,9 +354,8 @@ func TestExec(t *testing.T) {
 	}
 
 	t.Setenv("T3CODE_THREAD_ID", "thread-1")
-	t.Setenv("TAIL_MODE_SHARED", "1")
 	h = newHandler(testStore(t), CLI)
-	r, err := h.exec(context.Background(), "tail_start", []byte(`{"cmd":"make","owner":"me"}`)) // relative dir: allowed
+	r, err := h.exec(context.Background(), "tail_start", []byte(`{"cmd":"make","owner":"me"}`))
 	if err != nil || r.Job == "" || !strings.Contains(r.Text, "job: "+r.Job+"\n") || !strings.Contains(r.Text, "owner: me\n") {
 		t.Errorf("cli start %v %+v", err, r)
 	}
