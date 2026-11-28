@@ -42,10 +42,10 @@ func TestCmdArgv(t *testing.T) {
 		t.Fatalf("default argv %q", got)
 	}
 	got = recordArgv(t, cmdWith(t, CmdConfig{
-		Cmd: "make", Dir: "/srv/a b", Shell: "/bin/zsh", Login: true,
+		Cmd: "make", Dir: "/srv/a b", Shell: "/bin/zsh",
 		Env: map[string]string{"Z": "x'y $HOME", "A_1": "", "PYTHONUNBUFFERED": "0"},
 	}))
-	want := []string{"/bin/zsh", "-lc", "cd -- '/srv/a b' || exit 97\n" +
+	want := []string{"/bin/zsh", "-c", "cd -- '/srv/a b' || exit 97\n" +
 		"export A_1=''\nexport PYTHONUNBUFFERED=0\nexport Z='x'\"'\"'y $HOME'\nmake"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("argv %q\nwant %q", got, want)
@@ -54,6 +54,45 @@ func TestCmdArgv(t *testing.T) {
 		if got := recordArgv(t, cmdWith(t, CmdConfig{Cmd: "x", Dir: dir})); !strings.HasPrefix(got[2], cd+"\n") {
 			t.Errorf("dir %q: script %q", dir, got[2])
 		}
+	}
+}
+
+// login loads the target's shell profile first (default: remote targets only); PATH is the last marker
+// line the user's $SHELL prints among junk. Exit 127 records a hint.
+func TestCmdProfile(t *testing.T) {
+	off, on := false, true
+	for _, c := range []struct {
+		login  *bool
+		target string
+		want   bool
+	}{{nil, "", false}, {nil, "vps", true}, {&off, "vps", false}, {&on, "", true}} {
+		r := argvRecorder{target: c.target}
+		if err := cmdWith(t, CmdConfig{Cmd: "x", Login: c.login}).Stream(context.Background(), &r, false, func([]string) {}); err != nil {
+			t.Fatal(err)
+		}
+		if got := r.argv[0] == "sh" && r.argv[2] == profileStep && r.argv[4] == DefaultShell; got != c.want {
+			t.Errorf("login %v on %q: argv %q", c.login, c.target, r.argv)
+		}
+	}
+	fake := filepath.Join(t.TempDir(), "fakesh")
+	junk := `echo motd; printf 'no newline'; printf '\n__TM_PATH=/old\n__TM_PATH=/x/bin:/usr/bin:/bin\nbye\n'; echo oops >&2`
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\n"+junk+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SHELL", fake)
+	var c collector
+	if err := cmdWith(t, CmdConfig{Cmd: `echo "$PATH"`, Login: &on}).Stream(context.Background(), local(t), false, c.emit); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.get(); !reflect.DeepEqual(got, []string{"/x/bin:/usr/bin:/bin"}) {
+		t.Fatalf("lines %q", got)
+	}
+	spec := Spec{Kind: "cmd", Config: json.RawMessage(`{"cmd":"x"}`)}
+	if got := ExitHint(spec, "vps", 127); got != "exit 127: command not found on vps — check the name/PATH (profile loaded: yes) or use an absolute path" {
+		t.Errorf("hint %q", got)
+	}
+	if !strings.Contains(ExitHint(spec, "", 127), "on local — check the name/PATH (profile loaded: no)") || ExitHint(spec, "vps", 1) != "" {
+		t.Error("local or non-127 hint")
 	}
 }
 
@@ -212,18 +251,18 @@ func TestStreamHygiene(t *testing.T) {
 
 // ---- live ssh (TAIL_MODE_SSH_TEST_HOST)
 
-func TestSSHCmdDirEnvLogin(t *testing.T) {
+func TestSSHCmdDirEnv(t *testing.T) {
 	tr := sshHost(t)
 	var c collector
 	err := cmdWith(t, CmdConfig{
-		Cmd: `pwd; printf '%s|%s\n' "$GREETING" "$PYTHONUNBUFFERED"; shopt -q login_shell && echo login`,
-		Dir: "~", Env: map[string]string{"GREETING": "x'y $HOME\tz"}, Login: true,
+		Cmd: `pwd; printf '%s|%s\n' "$GREETING" "$PYTHONUNBUFFERED"`,
+		Dir: "~", Env: map[string]string{"GREETING": "x'y $HOME\tz"},
 	}).Stream(context.Background(), tr, false, c.emit)
 	if err != nil {
 		t.Fatal(err)
 	}
 	got := c.get()
-	if len(got) != 3 || !strings.HasPrefix(got[0], "/") || got[1] != "x'y $HOME\tz|1" || got[2] != "login" {
+	if len(got) != 2 || !strings.HasPrefix(got[0], "/") || got[1] != "x'y $HOME\tz|1" {
 		t.Fatalf("lines %q", got)
 	}
 	err = cmdWith(t, CmdConfig{Cmd: "echo ran", Dir: "/nonexistent-tail-mode"}).Stream(context.Background(), tr, false, func([]string) {})

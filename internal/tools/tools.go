@@ -256,7 +256,7 @@ func (h *handler) tools() []Tool {
 			h.start),
 		tool("tail_wait", "Block until a job prints a line matching until (a regex), e.g. a dev server's \"ready|listening\" line. "+
 			"For short waits (< ~1 min) only; with notifications on, end your turn instead. "+
-			"Required: job, until. Returns the matching lines and a cursor; or, after timeout, says it timed out "+
+			"Required: job, until. Returns the first matching line with up to 9 lines before it and a cursor; or, after timeout, says it timed out "+
 			"and gives the cursor to wait again from; or, if the job ends first, its exit code and last lines. For longer waits prefer "+
 			"tail_notify: it wakes you without blocking. "+deliver.DataNote,
 			h.wait),

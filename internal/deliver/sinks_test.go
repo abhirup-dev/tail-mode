@@ -35,6 +35,11 @@ func TestText(t *testing.T) {
 			t.Errorf("got %q", got)
 		}
 	}
+	// An exited job's error is a hint line (exit 127).
+	c127 := 127
+	if got := Text(Digest{Job: "j1", Status: "exited", Final: true, ExitCode: &c127, Error: "exit 127: hint"}, nil); !strings.Contains(got, " cursor 0\n  exit 127: hint\n"+DataNote) {
+		t.Errorf("127 hint: %q", got)
+	}
 	// The last line shows even when it did not match the filter, labelled; long lines are clipped.
 	final := Digest{Job: "j2", Name: "hillclimb", Host: "vps", Status: "exited", Final: true, ExitCode: &code, New: 2, Matched: 1,
 		Match: "ERR", From: 10, To: 16, Total: 16, LastLine: &Line{ID: 16, Text: "score 0.93 " + strings.Repeat("x", 300)},

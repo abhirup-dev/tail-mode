@@ -115,12 +115,13 @@ func TestRemoteCommandIsOneNeutralLine(t *testing.T) {
 	}
 }
 
+// The job's stderr arrives on stdout (one ssh channel) in write order.
 func TestRemoteRoundTripAndExitCode(t *testing.T) {
 	arg := "x'y $HOME\n\"two\" \\ !$ `id`"
 	eachShell(t, func(t *testing.T, shell string) {
-		_, out, wait := runRemote(t, shell, "sh", "-c", `printf '%s|\n' "$1"; exit 7`, "sh", arg)
+		_, out, wait := runRemote(t, shell, "sh", "-c", `printf '%s|\n' "$1"; echo err >&2; echo out; exit 7`, "sh", arg)
 		got, _ := io.ReadAll(out)
-		if code, _ := wait(); string(got) != arg+"|\n" || code != 7 {
+		if code, _ := wait(); string(got) != arg+"|\nerr\nout\n" || code != 7 {
 			t.Fatalf("output %q code %d", got, code)
 		}
 	})

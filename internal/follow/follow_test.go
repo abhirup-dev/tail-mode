@@ -114,8 +114,8 @@ func TestFollowCancel(t *testing.T) {
 	}
 }
 
-// WaitCursor returns the matches and where to wait again from (the last match, or the last line
-// checked); after -1 starts at the job's end; an ended or lost job ends the wait.
+// WaitCursor returns the first match with the lines before it and where to wait again from (the match,
+// or the last line checked); after -1 starts at the job's end; an ended or lost job ends the wait.
 func TestWaitCursor(t *testing.T) {
 	s, j := setup(t, true)
 	s.Append(j.ID, []string{"a", "ready 1", "b", "ready 2", "c"}, store.NowMS())

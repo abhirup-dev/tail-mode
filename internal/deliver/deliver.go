@@ -17,7 +17,7 @@ type Digest struct {
 	Final   bool   `json:"final"`             // job stopped running; last digest
 	// Set on the final digest: how the job ended. ExitCode is set when Status is "exited".
 	ExitCode *int   `json:"exit_code,omitempty"`
-	Error    string `json:"error,omitempty"` // failed jobs: why
+	Error    string `json:"error,omitempty"` // failed jobs: why; exited jobs: a hint (exit 127)
 	// Set on the final digest: the job's total line count and its last line (whether or not it matched
 	// Match; LastMatched says which), so the end is visible even with a filter.
 	Total       int64  `json:"total_lines,omitempty"`

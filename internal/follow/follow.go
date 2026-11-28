@@ -187,10 +187,10 @@ func toLine(l store.Line) deliver.Line {
 	return deliver.Line{ID: l.ID, TS: l.TS, Text: store.Clip(l.Text, maxText)}
 }
 
-// WaitCursor polls every second until a line after `after` matches until (code 0, ≤20 lines), the
-// timeout passes (WaitTimeout), or the job ends without a match (WaitEnded). timeout 0 = none. It also
-// returns the cursor reached: the last matching line on a match, else the last line checked, so
-// waiting again from it misses nothing.
+// WaitCursor polls every second until a line after `after` matches until (code 0: the first match and
+// up to 9 lines before it), the timeout passes (WaitTimeout), or the job ends without a match
+// (WaitEnded). timeout 0 = none. It also returns the cursor reached: the match, else the last line
+// checked, so waiting again from it misses nothing.
 func WaitCursor(ctx context.Context, s *store.Store, job store.Job, until *regexp.Regexp, timeout time.Duration, after int64) ([]store.Line, int, int64, error) {
 	cursor, err := startCursor(s, job.ID, after)
 	if err != nil {
@@ -212,12 +212,14 @@ func WaitCursor(ctx context.Context, s *store.Store, job store.Job, until *regex
 		if err != nil {
 			return nil, 0, cursor, err
 		}
-		lines, err := s.Read(store.ReadQuery{Job: job.ID, After: cursor, Grep: until, Limit: 20})
+		lines, err := s.Read(store.ReadQuery{Job: job.ID, After: cursor, Grep: until, Limit: 1})
 		if err != nil {
 			return nil, 0, cursor, err
 		}
 		if len(lines) > 0 {
-			return lines, 0, lines[len(lines)-1].ID, nil
+			m := lines[0]
+			lines, err = s.Read(store.ReadQuery{Job: job.ID, Before: m.ID, Tail: 9})
+			return append(lines, m), 0, m.ID, err
 		}
 		if max > cursor {
 			cursor = max

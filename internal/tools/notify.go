@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"al.essio.dev/pkg/shellescape"
+	toon "github.com/toon-format/toon-go"
 
 	"github.com/abhirup-dev/tail-mode/internal/deliver"
 	"github.com/abhirup-dev/tail-mode/internal/follow"
@@ -155,15 +156,20 @@ func (h *handler) wait(ctx context.Context, in WaitIn) (string, error) {
 	switch code {
 	case 0:
 		head := deliver.DataNote + "\n" + kv(f("wait", fmt.Sprintf("matched %s in job %s", re, j.Label())))
-		return render(head, lineTable("lines", ls, false), func(shown int) string {
-			if shown > 0 {
-				cursor = ls[shown-1].ID
+		for { // the match is the last line: over the budget, drop context from the oldest
+			shown := 0
+			out := render(head, lineTable("lines", ls, false), func(n int) string {
+				shown = n
+				return kv(f("cursor", cursor), f("next", fmt.Sprintf("pass after=%d to read or wait for newer lines only", cursor)))
+			})
+			if shown == len(ls) || len(ls) == 1 {
+				return out, nil
 			}
-			return kv(f("cursor", cursor), f("next", fmt.Sprintf("pass after=%d to read or wait for newer lines only", cursor)))
-		}), nil
+			ls = ls[1:]
+		}
 	case follow.WaitTimeout:
 		last, _ := h.s.Read(store.ReadQuery{Job: j.ID, Tail: 3, Limit: 3})
-		head := deliver.DataNote + "\n" + kv(f("wait", fmt.Sprintf("timed out after %s; no line matched %s", timeout, re)), f("job", h.jobSummary(j)))
+		head := deliver.DataNote + "\n" + kv(append([]toon.Field{f("wait", fmt.Sprintf("timed out after %s; no line matched %s", timeout, re))}, h.jobHeader(j)...)...)
 		return render(head, lineTable("last_lines", last, false), func(int) string {
 			return kv(f("cursor", cursor)) + helpBlock(
 				fmt.Sprintf("tail_wait job=%s until=%q after=%d keeps waiting", j.ID, in.Until, cursor),
@@ -171,7 +177,7 @@ func (h *handler) wait(ctx context.Context, in WaitIn) (string, error) {
 		}), nil
 	default: // follow.WaitEnded: the job ended without a match
 		last, _ := h.s.Read(store.ReadQuery{Job: j.ID, Tail: 5, Limit: 5})
-		head := deliver.DataNote + "\n" + kv(f("wait", fmt.Sprintf("job ended without a line matching %s", re)), f("job", h.jobSummary(j)))
+		head := deliver.DataNote + "\n" + kv(append([]toon.Field{f("wait", fmt.Sprintf("job ended without a line matching %s", re))}, h.jobHeader(j)...)...)
 		return render(head, lineTable("last_lines", last, false), func(int) string {
 			return kv(f("cursor", cursor))
 		}), nil

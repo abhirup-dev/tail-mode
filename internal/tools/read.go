@@ -27,11 +27,17 @@ type ReadIn struct {
 	Limit int    `json:"limit,omitempty" jsonschema:"max lines (default ${readLimit})"`
 }
 
-// jobSummary is the aggregate header of a job: status with exit code, line count, last output.
-func (h *handler) jobSummary(j store.Job) string {
+// jobHeader is the aggregate header of a job: status with exit code, line count, last output; and the
+// hint an exited job may have (exit 127).
+func (h *handler) jobHeader(j store.Job) []toon.Field {
 	_ = h.s.Stats(&j)
 	j, _ = jobs.Refresh(h.s, j) // fresh effective status, exit code and error; keeps the stats
-	return fmt.Sprintf("%s · %s · %d lines total · last output %s", j.Label(), store.Clip(j.StatusText(), 300), j.Lines, store.Ago(j.LastTS, "never"))
+	out := []toon.Field{f("job", fmt.Sprintf("%s · %s · %d lines total · last output %s",
+		j.Label(), store.Clip(j.StatusText(), 300), j.Lines, store.Ago(j.LastTS, "never")))}
+	if j.Status == "exited" && j.Error != "" {
+		out = append(out, f("hint", store.Clip(j.Error, 300)))
+	}
+	return out
 }
 
 func (h *handler) read(_ context.Context, in ReadIn) (string, error) {
@@ -52,7 +58,7 @@ func (h *handler) read(_ context.Context, in ReadIn) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	head := deliver.DataNote + "\n" + kv(f("job", h.jobSummary(j)))
+	head := deliver.DataNote + "\n" + kv(h.jobHeader(j)...)
 	return render(head, lineTable("lines", ls, false), func(shown int) string {
 		if shown == 0 {
 			what := "new lines"

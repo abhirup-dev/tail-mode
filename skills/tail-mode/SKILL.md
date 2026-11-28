@@ -17,7 +17,7 @@ descriptions and the `help` lines in each result: they are the guide. This file 
 ```sh
 tail-mode run --name web -- npm run dev                            # start; prints the job id first
 tail-mode run --name web --until 'ready|listening' -- npm run dev  # …and block until it is up
-tail-mode run --host vps --dir '~/app' --env PORT=8080 --login -- ./serve.sh
+tail-mode run --host vps --dir '~/app' --env PORT=8080 -- ./serve.sh
 ```
 
 After `--`, one argument is a verbatim shell command (`run -- 'make 2>&1 | tee build.log'`); several are
@@ -34,14 +34,16 @@ before tail-mode sees it, which is wrong with `--host`. Locally, `--dir` default
 
 ## Pitfalls
 
-- `command not found` (nvm, pyenv, cargo, brew …): the job runs a non-login, non-interactive shell. Add
-  `--login`. Tools set up only in `~/.bashrc` may still be missing (many return early when
-  non-interactive): use an absolute path, or source the file in the command.
+- `command not found` (exit 127; nvm, pyenv, mise, ~/.local/bin …): with `--host` the job first takes
+  PATH from your login shell's profile on the target (`--no-login` skips it; `--login` does it locally).
+  Anything else the profile sets (aliases, functions, other env) is not loaded: use an absolute path, or
+  source the file in the command.
 - Bash-isms (`[[ ]]`, arrays, `source`) need bash, the default `--shell`. `csh`/`tcsh`/`fish` are not
   supported (the dir/env preamble is POSIX).
 - `--env K=V` is exported on the target host; your own shell's env is not passed. `PYTHONUNBUFFERED=1` is
   set unless given, so Python output arrives line by line.
-- ANSI escapes are stripped; carriage-return progress keeps only the text after the last `\r`.
+- stdout and stderr are merged in write order. ANSI escapes are stripped; carriage-return progress keeps
+  only the text after the last `\r`.
 
 ## Getting woken without push (Claude Code)
 
@@ -56,8 +58,8 @@ timeout, 4 job ended). `tail_start`/`tail_notify` print this recipe when nothing
 `--match` over frequent unfiltered digests: each digest costs a turn.
 
 The jsonl digest (`follow --deliver jsonl`) has `final` (true on the last one) and, on the final digest,
-`exit_code` (exited jobs), `error` (failed jobs), `total_lines`, `last_line` (`{id, ts, text}`) and
-`last_matched`.
+`exit_code` (exited jobs), `error` (failed jobs; a hint on exit 127), `total_lines`, `last_line`
+(`{id, ts, text}`) and `last_matched`.
 
 ## Limits
 

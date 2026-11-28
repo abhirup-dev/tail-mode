@@ -67,14 +67,16 @@ func remoteScript(argv []string) string {
 // stdin EOF, which comes when the local ssh, the worker holding its stdin, or the connection goes away:
 //
 //   - "$@" runs with stdin /dev/null in its own process group (setsid, else `set -m`, which bash and
-//     ksh honour without a tty; dash and zsh refuse it, and then only the leader can be signalled);
+//     ksh honour without a tty; dash and zsh refuse it, and then only the leader can be signalled),
+//     with stderr on stdout (one ssh channel, so lines keep their write order) and, where stdbuf is
+//     installed, line-buffered;
 //   - a watchdog outside that group reads the saved stdin (fd 3) until EOF, then TERMs the group and,
 //     if anything is left after ~3 s, KILLs it;
 //   - when the leader exits by itself, leftovers in its group are reaped the same way, the watchdog is
 //     stopped, and the leader's exit status is the wrapper's.
 const remoteWrapper = `reap() { kill -TERM $1 2>/dev/null || return 0; for i in 1 2 3; do sleep 1; kill -0 $1 2>/dev/null || return 0; done; kill -KILL $1 2>/dev/null; }; ` +
-	`exec 3<&0; ` +
-	`if command -v setsid >/dev/null 2>&1; then setsid "$@" </dev/null 3<&- & p=$!; g=-$p; ` +
-	`else command set -m 2>/dev/null; "$@" </dev/null 3<&- & p=$!; case $- in *m*) g=-$p; command set +m;; *) g=$p;; esac; fi; ` +
+	`exec 3<&0; b=; command -v stdbuf >/dev/null 2>&1 && b='stdbuf -oL -eL'; ` +
+	`if command -v setsid >/dev/null 2>&1; then setsid $b "$@" </dev/null 2>&1 3<&- & p=$!; g=-$p; ` +
+	`else command set -m 2>/dev/null; $b "$@" </dev/null 2>&1 3<&- & p=$!; case $- in *m*) g=-$p; command set +m;; *) g=$p;; esac; fi; ` +
 	`(while read -r l; do :; done <&3; reap $g) >/dev/null 2>&1 & w=$!; ` +
 	`exec 3<&- 2>/dev/null; wait $p; rc=$?; kill $w 2>/dev/null; reap $g; exit $rc`

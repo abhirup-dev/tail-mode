@@ -299,13 +299,17 @@ func TestStop(t *testing.T) {
 	has(t, "unknown", callErr(t, cs, "tail_stop", map[string]any{"job": "nope"}), `error: no job "nope"`, "\nhelp: tail_jobs")
 }
 
-// tail_wait: a match, a timeout on a live job, a job that ended without a match; after skips earlier lines.
+// tail_wait: a match with up to 9 lines before it, a timeout on a live job, a job that ended without a
+// match; after skips earlier lines.
 func TestWait(t *testing.T) {
 	s := testStore(t)
 	testutil.Job(t, s, store.Job{ID: "j000004", Name: "srv"}, "booting", "listening on :3000") // starting: live in its grace period
+	testutil.Job(t, s, store.Job{ID: "j000005", Name: "many"}, "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "ready", "after")
 	cs := client(t, s)
 	has(t, "match", call(t, cs, "tail_wait", map[string]any{"job": "srv", "until": "listening"}),
-		deliver.DataNote+"\nwait: matched /listening/ in job j000004 (srv)\nlines[1]{id,time,text}:\n  5,", "cursor: 5\n")
+		deliver.DataNote+"\nwait: matched /listening/ in job j000004 (srv)\nlines[2]{id,time,text}:\n  4,", "cursor: 5\n")
+	has(t, "window", call(t, cs, "tail_wait", map[string]any{"job": "many", "until": "ready"}),
+		"lines[10]{id,time,text}:\n  8,\"", ",\"3\"\n", ",ready\ncursor: 17\n")
 	has(t, "timeout", call(t, cs, "tail_wait", map[string]any{"job": "srv", "until": "ready", "timeout": "100ms"}),
 		"wait: timed out after 100ms; no line matched /ready/", "last_lines[2]{id,time,text}:", "cursor: 5\n",
 		`tail_wait job=j000004 until="ready" after=5 keeps waiting`, "tail_notify job=j000004")

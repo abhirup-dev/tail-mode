@@ -176,11 +176,14 @@ func TestFileStreamCancelKillsGroup(t *testing.T) {
 	}
 }
 
-// argvRecorder is a transport that records argv and runs `true`.
-type argvRecorder struct{ argv []string }
+// argvRecorder is a transport (on target) that records argv and runs `true`.
+type argvRecorder struct {
+	argv   []string
+	target string
+}
 
-func (*argvRecorder) Name() string   { return "rec" }
-func (*argvRecorder) Target() string { return "" }
+func (*argvRecorder) Name() string     { return "rec" }
+func (r *argvRecorder) Target() string { return r.target }
 func (r *argvRecorder) Command(ctx context.Context, argv ...string) *exec.Cmd {
 	r.argv = argv
 	return exec.CommandContext(ctx, "true")

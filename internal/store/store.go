@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -318,11 +319,12 @@ func scanLines(rows *sql.Rows, keep func(Line) bool, max int) ([]Line, error) {
 }
 
 type ReadQuery struct {
-	Job   string         // required (job id)
-	After int64          // exclusive cursor
-	Tail  int            // >0: the newest Tail lines after After (returned oldest first)
-	Grep  *regexp.Regexp // optional filter
-	Limit int            // max lines returned (default ReadLimit)
+	Job    string         // required (job id)
+	After  int64          // exclusive cursor
+	Before int64          // >0: only lines with id < Before
+	Tail   int            // >0: the newest Tail lines after After (returned oldest first)
+	Grep   *regexp.Regexp // optional filter
+	Limit  int            // max lines returned (default ReadLimit)
 }
 
 // Read returns lines oldest first. With Grep, it scans forward until Limit matches.
@@ -330,15 +332,18 @@ func (s *Store) Read(q ReadQuery) ([]Line, error) {
 	if q.Limit <= 0 {
 		q.Limit = ReadLimit
 	}
+	if q.Before <= 0 {
+		q.Before = math.MaxInt64
+	}
 	var rows *sql.Rows
 	var err error
 	switch {
 	case q.Tail > 0 && q.Grep == nil:
-		rows, err = s.db.Query(`SELECT id,job,ts,text FROM (SELECT id,job,ts,text FROM lines WHERE job=? AND id>? ORDER BY id DESC LIMIT ?) ORDER BY id`, q.Job, q.After, min(q.Tail, q.Limit))
+		rows, err = s.db.Query(`SELECT id,job,ts,text FROM (SELECT id,job,ts,text FROM lines WHERE job=? AND id>? AND id<? ORDER BY id DESC LIMIT ?) ORDER BY id`, q.Job, q.After, q.Before, min(q.Tail, q.Limit))
 	case q.Tail > 0: // newest matches
-		rows, err = s.db.Query(`SELECT id,job,ts,text FROM lines WHERE job=? AND id>? ORDER BY id DESC`, q.Job, q.After)
+		rows, err = s.db.Query(`SELECT id,job,ts,text FROM lines WHERE job=? AND id>? AND id<? ORDER BY id DESC`, q.Job, q.After, q.Before)
 	default:
-		rows, err = s.db.Query(`SELECT id,job,ts,text FROM lines WHERE job=? AND id>? ORDER BY id`, q.Job, q.After)
+		rows, err = s.db.Query(`SELECT id,job,ts,text FROM lines WHERE job=? AND id>? AND id<? ORDER BY id`, q.Job, q.After, q.Before)
 	}
 	if err != nil {
 		return nil, err

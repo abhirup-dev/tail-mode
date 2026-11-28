@@ -316,7 +316,7 @@ func run(ctx context.Context, s *store.Store, id string) error {
 			case err == nil:
 				return finish("exited", 0, "")
 			case errors.As(err, &ee):
-				return finish("exited", ee.ExitCode(), "")
+				return finish("exited", ee.ExitCode(), source.ExitHint(spec, j.Target, ee.ExitCode()))
 			default:
 				return fail(err)
 			}

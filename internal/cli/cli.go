@@ -123,7 +123,7 @@ type cmdOpts struct {
 	Dir   string            `placeholder:"D" help:"With a command: working dir (default: the current dir; remote: home). Quote '~/x' so it is the target's home."`
 	Env   map[string]string `placeholder:"K=V" mapsep:"none" help:"With a command: export K=V before it (repeatable). PYTHONUNBUFFERED=1 is set unless given."`
 	Shell string            `placeholder:"S" help:"With a command: POSIX shell to run it with, name or absolute path (default ${shell})."`
-	Login bool              `help:"With a command: run it in a login shell (-lc), so profile files set PATH."`
+	Login *bool             `negatable:"" help:"With a command: first take PATH from the target user's shell profile (default: on with --host)."`
 }
 
 func (o cmdOpts) set(in *tools.StartIn) {

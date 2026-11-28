@@ -76,9 +76,9 @@ func StartNotifier(s, job string, Options) (pid int, err error) // returns at on
 
 | | Behaviour |
 |---|---|
-| `ssh` | `ssh -o BatchMode=yes … -- <host> <remote>`; host must not be empty, start with `-` or contain whitespace/control chars. Remote string is login-shell neutral: `exec sh -c 's=$(printf %s <b64> \| base64 -d) \|\| exit 127; eval "$s"'`. A watchdog kills the remote process group on stdin EOF (works with ControlMaster). |
+| `ssh` | `ssh -o BatchMode=yes … -- <host> <remote>`; host must not be empty, start with `-` or contain whitespace/control chars. Remote string is login-shell neutral: `exec sh -c 's=$(printf %s <b64> \| base64 -d) \|\| exit 127; eval "$s"'`. The job's stderr goes to its stdout (stdout and stderr are merged in write order), line-buffered with `stdbuf -oL -eL` where installed. A watchdog kills the remote process group on stdin EOF (works with ControlMaster). |
 | `file` | `tail -n <backlog> -F -- <path>` (backlog default 50, 0 on resume, restart on by default). `~`/`~/x` = target's home; `~user` rejected. |
-| `cmd` | `[shell, -c\|-lc, script]` (shell default bash): `cd -- <dir> \|\| exit 97`, sorted `export K=V` (`PYTHONUNBUFFERED=1` unless set), then the command. Restart off by default. POSIX shells only. |
+| `cmd` | `[shell, -c, script]` (shell default bash): `cd -- <dir> \|\| exit 97`, sorted `export K=V` (`PYTHONUNBUFFERED=1` unless set), then the command. Restart off by default. POSIX shells only. `login` (default: on for ssh, off locally) prefixes `sh -c <profile step> sh`: PATH from the last `__TM_PATH=` line of `"${SHELL:-sh}" -lic` (≤ 10 s via `timeout` if present, its output discarded), then exec the job shell. Exit 127 records a hint as the job's `error` (final digest line, `hint:` in read/wait headers). |
 | local defaults | local transport only: empty cmd dir → caller cwd, relative dir/file → absolute; cwd unknown → error. Remote empty dir = remote home. |
 | stream | own process group; lines > 1 MiB cut; after leader exit, or SIGTERM to the group on cancel, drain ≤ 2 s then kill group. Trailing `\r` dropped, text after last `\r` kept, ANSI stripped; lines emptied by that dropped. |
 
@@ -92,7 +92,7 @@ and ssh, so `--host` is the only transport flag.
 
 | Command | Tool | Flags |
 |---|---|---|
-| `start` | `tail_start` | `[--name] [--host H] [--[no-]restart]` + `--file P [--backlog N]` \| `--cmd C [--dir] [--env K=V]… [--shell] [--login]` \| `--source K --config JSON` |
+| `start` | `tail_start` | `[--name] [--host H] [--[no-]restart]` + `--file P [--backlog N]` \| `--cmd C [--dir] [--env K=V]… [--shell] [--[no-]login]` \| `--source K --config JSON` |
 | `run -- CMD…` | `tail_start` (+ `tail_wait` from cursor 0) | `start`'s cmd flags, `[--every D] [--match RE] [--until RE [--timeout 30m]]`; one arg verbatim, several shell-quoted; checks `--until`, `--timeout` > 0 and a non-empty command before starting |
 | `stop <job>` / `jobs` | `tail_stop` / `tail_jobs` | `[--force]` / `[--all]` |
 | `read <job>` / `search <fts>` / `sql <select>` | `tail_read` / `tail_search` / `tail_sql` | the tool's params as flags |
@@ -117,8 +117,8 @@ the CLI's owner wins over the env thread and its cwd is the caller's; MCP and Pi
 
 | Tool | Params | Notes |
 |---|---|---|
-| `tail_start` | `file\|cmd\|source+config, host?, name?, backlog?, restart?, dir?, env?, shell?, login?, notify_every?, notify_match?` | echoes owner (`this T3 thread` / `this Pi session`, never the raw id), where, dir/path; notifier from the job's first line |
-| `tail_wait` | `job, until, timeout?, after?` | match / timeout (last 3 lines) / ended (last 5 lines), each with cursor |
+| `tail_start` | `file\|cmd\|source+config, host?, name?, backlog?, restart?, dir?, env?, shell?, login?, notify_every?, notify_match?` | echoes owner (`this T3 thread` / `this Pi session`, never the raw id), where, dir/path, profile; notifier from the job's first line |
+| `tail_wait` | `job, until, timeout?, after?` | first match + up to 9 lines before it (oldest context dropped over budget) / timeout (last 3 lines) / ended (last 5 lines), each with cursor |
 | `tail_read` | `job, after?, tail?, grep?, limit?` | header: status, total lines, last output |
 | `tail_search` | `query, job?, all?, since?, limit?` | owner-scoped unless `all` or `job`; a query FTS5 rejects is searched as a literal phrase, and the result says so |
 | `tail_jobs` | `all?` | id, name, status, lines, last_output, source (+owner) |

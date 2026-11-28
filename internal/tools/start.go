@@ -22,7 +22,7 @@ type StartIn struct {
 	Dir         string            `json:"dir,omitempty" jsonschema:"cmd only: working dir; for host jobs on that host (default: its home)"`
 	Env         map[string]string `json:"env,omitempty" jsonschema:"cmd only: variables exported in the job's shell on the target host (the remote host for host jobs), before the command; PYTHONUNBUFFERED=1 unless set"`
 	Shell       string            `json:"shell,omitempty" jsonschema:"cmd only: POSIX shell to run it with, name or absolute path (default ${shell})"`
-	Login       bool              `json:"login,omitempty" jsonschema:"cmd only: run in a login shell (-lc) so profile files set PATH (use when a tool is not found)"`
+	Login       *bool             `json:"login,omitempty" jsonschema:"cmd only: first take PATH from your shell profile on the target (default: true for host jobs, false locally)"`
 	Source      string            `json:"source,omitempty" jsonschema:"source adapter kind; use with config"`
 	Config      any               `json:"config,omitempty" jsonschema:"adapter config object, e.g. file: {path, backlog}; cmd: {cmd, dir, env, shell, login}"`
 	Host        string            `json:"host,omitempty" jsonschema:"ssh host to run on (as in your ssh config, e.g. vps or user@box); omit to run locally"`
@@ -56,7 +56,7 @@ func startOpts(in StartIn) (jobs.StartOpts, error) {
 		return o, fail(startUsage, "config needs source")
 	case in.Backlog != nil && in.File == "":
 		return o, fail("with source, put backlog in config", "backlog applies to file")
-	case (in.Dir != "" || len(in.Env) > 0 || in.Shell != "" || in.Login) && in.Cmd == "":
+	case (in.Dir != "" || len(in.Env) > 0 || in.Shell != "" || in.Login != nil) && in.Cmd == "":
 		return o, fail("with source, put them in config", "dir, env, shell and login apply to cmd")
 	case in.File != "":
 		o.Spec.Kind, cfg = "file", source.FileConfig{Path: in.File, Backlog: in.Backlog}
@@ -162,18 +162,24 @@ func (h *handler) resolved(j store.Job) []toon.Field {
 		where = j.Transport + " " + j.Target
 	}
 	out := []toon.Field{f("owner", owner), f("on", where)}
-	var sp struct {
-		Config struct{ Dir, Path string }
-	}
-	_ = json.Unmarshal([]byte(j.Spec), &sp)
+	var spec source.Spec
+	var cfg struct{ Dir, Path string }
+	_ = json.Unmarshal([]byte(j.Spec), &spec)
+	_ = json.Unmarshal(spec.Config, &cfg)
 	switch {
-	case sp.Config.Dir != "":
-		out = append(out, f("dir", sp.Config.Dir))
+	case cfg.Dir != "":
+		out = append(out, f("dir", cfg.Dir))
 	case j.Kind == "cmd":
 		out = append(out, f("dir", "~ (remote home)"))
 	}
-	if sp.Config.Path != "" {
-		out = append(out, f("path", sp.Config.Path))
+	if cfg.Path != "" {
+		out = append(out, f("path", cfg.Path))
+	}
+	switch {
+	case source.Profile(spec, j.Target != ""):
+		out = append(out, f("profile", "PATH from $SHELL -lic on the target (login: false to skip)"))
+	case j.Kind == "cmd":
+		out = append(out, f("profile", "off"))
 	}
 	return out
 }
