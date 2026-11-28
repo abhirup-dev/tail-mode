@@ -22,6 +22,13 @@ import (
 	"github.com/abhirup-dev/tail-mode/internal/transport"
 )
 
+// NameRunningError: Start refuses a name the owner already has running (names must stay unambiguous).
+type NameRunningError struct{ Name, ID string }
+
+func (e *NameRunningError) Error() string {
+	return fmt.Sprintf("job %q is already running as %s", e.Name, e.ID)
+}
+
 // Timings; variables so tests can shorten them.
 var (
 	claimWait     = 2 * time.Second  // Start waits this long for the worker to claim
@@ -65,6 +72,11 @@ func Start(s *store.Store, o StartOpts) (store.Job, error) {
 	o, err := o.Resolve()
 	if err != nil {
 		return store.Job{}, err
+	}
+	if o.Name != "" {
+		if cur, err := s.GetJob(o.Name, o.Owner); err == nil && cur.Name == o.Name && store.Live(Status(s, cur)) {
+			return store.Job{}, &NameRunningError{o.Name, cur.ID}
+		}
 	}
 	src, err := source.New(o.Spec)
 	if err != nil {

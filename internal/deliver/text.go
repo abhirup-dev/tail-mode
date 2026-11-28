@@ -38,7 +38,7 @@ func Text(d Digest, more More) string {
 		fmt.Fprintf(&b, "[tail-mode] %s FINISHED · %s · %d lines · %s\n", ref, d.StatusText(), d.Total, d.lastText())
 		fmt.Fprintf(&b, "  on %s · %s · cursor %d\n", host, news, d.To)
 	} else {
-		fmt.Fprintf(&b, "[tail-mode] %s on %s · %s · %s · cursor %d\n", ref, host, news, d.StatusText(), d.To)
+		fmt.Fprintf(&b, "[tail-mode] %s on %s · %s · %s · cursor %d · more digests follow automatically\n", ref, host, news, d.StatusText(), d.To)
 	}
 	for _, l := range d.Lines {
 		fmt.Fprintf(&b, "  %s %s\n", store.Clock(l.TS), l.Text)

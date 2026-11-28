@@ -105,6 +105,10 @@ func (h *handler) start(ctx context.Context, in StartIn) (string, error) {
 		}
 		return "", fail(`pass dir as an absolute path, e.g. dir="/home/me/app" (with source+config, put "dir" in config), or as ~/x (run pwd in your shell to get your dir)`, "%s", why)
 	}
+	var nr *jobs.NameRunningError
+	if errors.As(err, &nr) {
+		return "", fail(fmt.Sprintf("it is already yours: tail_read job=%s reads it, tail_notify job=%s watches it; or tail_stop it first, or pick another name", nr.ID, nr.ID), "%v", err)
+	}
 	if err != nil {
 		return "", err
 	}

@@ -229,6 +229,10 @@ func TestStartStopWorker(t *testing.T) {
 		t.Fatal("worker does not hold its lock")
 	}
 	testutil.WaitFor(t, 3*time.Second, lines(t, s, j.ID, 1))
+	var nr *NameRunningError
+	if _, err := Start(s, StartOpts{Name: "w", Spec: source.Spec{Kind: "cmd", Config: b}}); !errors.As(err, &nr) || nr.ID != j.ID {
+		t.Fatalf("second start of a running name: %v", err)
+	}
 	if js, _ := List(s, "", true); len(js) != 1 || js[0].Status != "running" || js[0].Lines != 1 {
 		t.Fatalf("list %+v", js)
 	}

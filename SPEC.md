@@ -137,7 +137,7 @@ the CLI's owner wins over the env thread and its cwd is the caller's; MCP and Pi
   local `cmd` needs an absolute or `~` dir and local `file` an absolute or `~` path, checked on the
   final spec.
 - **Ownership**: names resolve within the caller's owner, ids across owners; same name under two owners
-  never collides; owner-`''` jobs are stoppable by anyone.
+  never collides; a name the owner already has running is refused; owner-`''` jobs are stoppable by anyone.
 
 Pi (`pi/tail-mode.ts`) registers `tool --list` verbatim and runs `tool <name> - --client=pi` with
 `TAIL_MODE_OWNER=pi:<session id>`; its only logic is the wake mechanism: one per-session jsonl follower per job, each digest a `followUp` message
