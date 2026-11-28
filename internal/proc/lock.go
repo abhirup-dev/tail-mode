@@ -10,7 +10,10 @@ import (
 	"github.com/gofrs/flock"
 )
 
-// Lock takes an exclusive lock on path (creating it and its dir), retrying for up to 2 s.
+// LockWait is how long Lock retries a held lock (a test knob).
+var LockWait = 2 * time.Second
+
+// Lock takes an exclusive lock on path (creating it and its dir), retrying for up to LockWait.
 // It fails if another process keeps holding it. The fd is close-on-exec, so children never inherit
 // the lock; it is released by release() or when this process dies.
 func Lock(path string) (release func(), err error) {
@@ -18,7 +21,7 @@ func Lock(path string) (release func(), err error) {
 		return nil, err
 	}
 	f := flock.New(path)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), LockWait)
 	defer cancel()
 	ok, err := f.TryLockContext(ctx, 50*time.Millisecond)
 	if !ok {

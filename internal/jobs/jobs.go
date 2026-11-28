@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -33,6 +32,10 @@ var (
 	restartMin    = time.Second
 	restartMax    = 30 * time.Second
 	healthyAfter  = 60 * time.Second // a run this long resets the restart backoff
+	// retried reports a failed store write about to be retried.
+	retried = func(what string, err error, d time.Duration) {
+		fmt.Fprintf(os.Stderr, "tail-mode _job: %s failed, retrying in %v: %v\n", what, d.Round(time.Millisecond), err)
+	}
 )
 
 type StartOpts struct {
@@ -56,9 +59,6 @@ func (o StartOpts) Resolve() (StartOpts, error) {
 	o.Spec, err = source.LocalDefaults(o.Spec, o.Cwd)
 	return o, err
 }
-
-// LockPath is the worker's liveness lock: <dir>/run/<id>.lock.
-func LockPath(s *store.Store, id string) string { return filepath.Join(s.Dir, "run", id+".lock") }
 
 // Start applies local defaults (Resolve), validates the source and transport, creates a "starting" row,
 // launches the detached worker, and waits up to 2 s for it to claim the job. It returns the fresh row.
@@ -106,7 +106,7 @@ func Status(s *store.Store, j store.Job) string {
 	if !store.Live(j.Status) {
 		return j.Status
 	}
-	if proc.Locked(LockPath(s, j.ID)) {
+	if proc.Locked(s.JobLock(j.ID)) {
 		return j.Status
 	}
 	// The worker finishes its row before releasing the lock, so a fresh read settles a stale j.
@@ -150,8 +150,8 @@ func Refresh(s *store.Store, j store.Job) (store.Job, error) {
 	return cur, nil
 }
 
-// NotOwnerError is Stop refusing another owner's job without force. It names no flag or param: the
-// CLI adds "--force", the MCP server "force: true".
+// NotOwnerError is Stop refusing another owner's job without force. It names no flag or param:
+// tail_stop adds "force: true".
 type NotOwnerError struct{ Job, Owner, Caller string }
 
 func (e *NotOwnerError) Error() string {
@@ -188,7 +188,7 @@ func Stop(s *store.Store, ref, owner string, force bool) (store.Job, error) {
 	}
 	// shortcut: on SIGKILL the source child has its own process group and survives until its next write
 	// hits SIGPIPE; record the child's pgid if hung workers become common.
-	proc.Terminate(j.PID, LockPath(s, j.ID), true, stopWait)
+	proc.Terminate(j.PID, s.JobLock(j.ID), true, stopWait)
 	// Non-force: keep a terminal status the worker wrote itself (stopped, or failed if it dropped lines).
 	if err := s.Finish(j.ID, "stopped", 0, "", false); err != nil {
 		return j, err
@@ -201,7 +201,7 @@ func Stop(s *store.Store, ref, owner string, force bool) (store.Job, error) {
 func Run(s *store.Store, id string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
-	release, err := proc.Lock(LockPath(s, id))
+	release, err := proc.Lock(s.JobLock(id))
 	if err != nil {
 		return err
 	}
@@ -219,9 +219,7 @@ func retryWrite(ctx context.Context, budget time.Duration, what string, op func(
 		backoff.WithInitialInterval(100*time.Millisecond),
 		backoff.WithMaxInterval(5*time.Second),
 		backoff.WithMaxElapsedTime(budget))
-	return backoff.RetryNotify(op, backoff.WithContext(b, ctx), func(err error, d time.Duration) {
-		fmt.Fprintf(os.Stderr, "tail-mode _job: %s failed, retrying in %v: %v\n", what, d.Round(time.Millisecond), err)
-	})
+	return backoff.RetryNotify(op, backoff.WithContext(b, ctx), func(err error, d time.Duration) { retried(what, err, d) })
 }
 
 func run(ctx context.Context, s *store.Store, id string) error {

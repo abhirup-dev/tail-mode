@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/abhirup-dev/tail-mode/internal/testutil"
 	"github.com/abhirup-dev/tail-mode/internal/transport"
 )
 
@@ -97,7 +98,7 @@ func TestLeaderExitEndsStreamDespiteBackgroundChild(t *testing.T) {
 	}
 	b, _ := os.ReadFile(pidFile)
 	pid, _ := strconv.Atoi(strings.TrimSpace(string(b)))
-	waitFor(t, func() bool { return pid > 0 && syscall.Kill(pid, 0) != nil }) // group was killed
+	testutil.WaitFor(t, 5*time.Second, func() bool { return pid > 0 && syscall.Kill(pid, 0) != nil }) // group was killed
 }
 
 // rawTransport leaves Stdin nil, like ssh, so stream must hold a silent stdin open.
@@ -156,11 +157,11 @@ func TestFileStreamCancelKillsGroup(t *testing.T) {
 	var c collector
 	done := make(chan error)
 	go func() { done <- src.Stream(ctx, local(t), false, c.emit) }()
-	waitFor(t, func() bool { return len(c.get()) == 2 })
+	testutil.WaitFor(t, 5*time.Second, func() bool { return len(c.get()) == 2 })
 	f, _ := os.OpenFile(p, os.O_APPEND|os.O_WRONLY, 0)
 	f.WriteString("new\n")
 	f.Close()
-	waitFor(t, func() bool { return len(c.get()) == 3 })
+	testutil.WaitFor(t, 5*time.Second, func() bool { return len(c.get()) == 3 })
 	if got := c.get(); !reflect.DeepEqual(got, []string{"old2", "old3", "new"}) {
 		t.Fatalf("lines %q", got)
 	}
@@ -252,14 +253,4 @@ func TestReadLinesReturnsReadErrors(t *testing.T) {
 	if !reflect.DeepEqual(got, []string{"one", "tw"}) {
 		t.Fatalf("lines %q", got)
 	}
-}
-
-func waitFor(t *testing.T, cond func() bool) {
-	t.Helper()
-	for end := time.Now().Add(5 * time.Second); time.Now().Before(end); time.Sleep(20 * time.Millisecond) {
-		if cond() {
-			return
-		}
-	}
-	t.Fatal("timeout")
 }

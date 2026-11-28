@@ -8,10 +8,12 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+
 	"github.com/abhirup-dev/tail-mode/internal/follow"
 	"github.com/abhirup-dev/tail-mode/internal/jobs"
 	"github.com/abhirup-dev/tail-mode/internal/store"
-	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/abhirup-dev/tail-mode/internal/testutil"
 )
 
 // TestMain clears T3CODE_THREAD_ID so no test can reach a real T3 thread, and so identity does not
@@ -21,20 +23,16 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+// testStore has job j000001 "web" (shared namespace, exited 3) with lines (default: hello, ERROR db
+// timeout, bye).
 func testStore(t *testing.T, lines ...string) *store.Store {
 	t.Helper()
-	s, err := store.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { s.Close() })
-	if err := s.CreateJob(store.Job{ID: "j000001", Name: "web", Kind: "cmd", Transport: "local", Spec: `{"kind":"cmd"}`, Describe: "x", Status: "exited", StartedAt: store.NowMS()}); err != nil {
-		t.Fatal(err)
-	}
+	s := testutil.Store(t)
 	if len(lines) == 0 {
 		lines = []string{"hello", "ERROR db timeout", "bye"}
 	}
-	if err := s.Append("j000001", lines, store.NowMS()); err != nil {
+	testutil.Job(t, s, store.Job{ID: "j000001", Name: "web", Describe: "x"}, lines...)
+	if err := s.Finish("j000001", "exited", 3, "", true); err != nil {
 		t.Fatal(err)
 	}
 	return s
@@ -46,7 +44,7 @@ func connect(t *testing.T, s *store.Store, shared bool) *mcp.ClientSession {
 	t.Helper()
 	ctx := context.Background()
 	ct, st := mcp.NewInMemoryTransports()
-	ss, err := newServer(&handler{s: s, shared: shared, thread: EnvThread()}).Connect(ctx, st, nil)
+	ss, err := newServer(&handler{s: s, c: MCP, shared: shared, thread: EnvThread()}).Connect(ctx, st, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,8 +56,7 @@ func connect(t *testing.T, s *store.Store, shared bool) *mcp.ClientSession {
 	return cs
 }
 
-func client(t *testing.T, s *store.Store) *mcp.ClientSession       { return connect(t, s, false) }
-func sharedClient(t *testing.T, s *store.Store) *mcp.ClientSession { return connect(t, s, true) }
+func client(t *testing.T, s *store.Store) *mcp.ClientSession { return connect(t, s, false) }
 
 // callResult returns a tool's text and whether it is a tool error; transport errors are returned.
 func callResult(cs *mcp.ClientSession, tool string, args map[string]any) (string, bool, error) {
@@ -70,28 +67,19 @@ func callResult(cs *mcp.ClientSession, tool string, args map[string]any) (string
 	return res.Content[0].(*mcp.TextContent).Text, res.IsError, nil
 }
 
-func call(t *testing.T, cs *mcp.ClientSession, tool string, args map[string]any) string {
+// call returns a tool's text, failing the test unless the call was (wantErr) or was not a tool error.
+func call(t *testing.T, cs *mcp.ClientSession, tool string, args map[string]any, wantErr ...bool) string {
 	t.Helper()
 	text, isErr, err := callResult(cs, tool, args)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if isErr {
-		t.Fatalf("%s: tool error: %s", tool, text)
+	if err != nil || isErr != (len(wantErr) > 0 && wantErr[0]) {
+		t.Fatalf("%s %v: transport error %v, tool error %v:\n%s", tool, args, err, isErr, text)
 	}
 	return text
 }
 
 func callErr(t *testing.T, cs *mcp.ClientSession, tool string, args map[string]any) string {
 	t.Helper()
-	text, isErr, err := callResult(cs, tool, args)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !isErr {
-		t.Fatalf("%s %v: want a tool error, got:\n%s", tool, args, text)
-	}
-	return text
+	return call(t, cs, tool, args, true)
 }
 
 // fakes replaces the job/notifier seams. startJob resolves like jobs.Start and inserts a "starting" row
@@ -102,9 +90,7 @@ func fakes(t *testing.T) (last func() jobs.StartOpts, notes func() []follow.Opti
 	var started jobs.StartOpts
 	var ns []follow.Options
 	n := 8
-	oldJob, oldNote := startJob, startNotifier
-	t.Cleanup(func() { startJob, startNotifier = oldJob, oldNote })
-	startJob = func(s *store.Store, o jobs.StartOpts) (store.Job, error) {
+	testutil.Swap(t, &startJob, func(s *store.Store, o jobs.StartOpts) (store.Job, error) {
 		mu.Lock()
 		started, n = o, n+1
 		id := fmt.Sprintf("j%06x", n)
@@ -126,13 +112,13 @@ func fakes(t *testing.T) (last func() jobs.StartOpts, notes func() []follow.Opti
 			return j, err
 		}
 		return s.GetJob(j.ID, "")
-	}
-	startNotifier = func(_ *store.Store, _ string, o follow.Options) (int, error) {
+	})
+	testutil.Swap(t, &startNotifier, func(_ *store.Store, _ string, o follow.Options) (int, error) {
 		mu.Lock()
 		defer mu.Unlock()
 		ns = append(ns, o)
 		return 4242, nil
-	}
+	})
 	return func() jobs.StartOpts { mu.Lock(); defer mu.Unlock(); return started },
 		func() []follow.Options { mu.Lock(); defer mu.Unlock(); return append([]follow.Options(nil), ns...) }
 }

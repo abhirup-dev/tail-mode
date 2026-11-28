@@ -75,7 +75,9 @@ func eachShell(t *testing.T, fn func(t *testing.T, shell string)) {
 }
 
 // runRemote runs the remote command string the way the remote login shell would (`<shell> -c`), with
-// stdin on a pipe the caller closes to simulate the connection going away.
+// stdin on a pipe the caller closes to simulate the connection going away. out is stdout only: without
+// setsid (macOS) the wrapper's `set -m` fallback can race bash's own setpgid under load and warn "child
+// setpgid … Operation not permitted" on stderr, which must not be read as the job's output.
 func runRemote(t *testing.T, shell string, argv ...string) (stdin io.WriteCloser, out *bufio.Reader, wait func() (int, time.Duration)) {
 	t.Helper()
 	tr, _ := New("ssh", "x")
@@ -83,7 +85,6 @@ func runRemote(t *testing.T, shell string, argv ...string) (stdin io.WriteCloser
 	cmd := exec.Command(shell, "-c", args[len(args)-1])
 	stdin, _ = cmd.StdinPipe()
 	stdout, _ := cmd.StdoutPipe()
-	cmd.Stderr = cmd.Stdout
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -178,9 +179,8 @@ func assertGone(t *testing.T, pid int) {
 	if pid == 0 {
 		t.Fatal("no child pid")
 	}
-	if syscall.Kill(pid, 0) == nil {
-		time.Sleep(500 * time.Millisecond) // let init reap the orphan
-		if syscall.Kill(pid, 0) == nil {
+	for end := time.Now().Add(time.Second); syscall.Kill(pid, 0) == nil; time.Sleep(10 * time.Millisecond) { // init reaps the orphan
+		if time.Now().After(end) {
 			syscall.Kill(pid, syscall.SIGKILL)
 			t.Fatalf("child %d survived", pid)
 		}

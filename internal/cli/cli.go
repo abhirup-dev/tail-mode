@@ -1,4 +1,6 @@
-// Package cli is layer 5's command line: every tail-mode command, parsed by one kong grammar.
+// Package cli is layer 5's command line, parsed by one kong grammar. Each job command maps its flags onto
+// one tool's args and runs that tool (internal/tools: the same handlers and text as MCP); follow, _job, mcp
+// and tool are the commands with no tool.
 package cli
 
 import (
@@ -13,7 +15,6 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
-	"text/tabwriter"
 	"time"
 
 	"al.essio.dev/pkg/shellescape"
@@ -22,7 +23,6 @@ import (
 	"github.com/abhirup-dev/tail-mode/internal/deliver"
 	"github.com/abhirup-dev/tail-mode/internal/follow"
 	"github.com/abhirup-dev/tail-mode/internal/jobs"
-	"github.com/abhirup-dev/tail-mode/internal/source"
 	"github.com/abhirup-dev/tail-mode/internal/store"
 	"github.com/abhirup-dev/tail-mode/internal/tools"
 )
@@ -30,22 +30,23 @@ import (
 // stdout is where command output goes (a test knob).
 var stdout io.Writer = os.Stdout
 
-// ExitError makes main exit with Code without printing anything (wait/run --until: 3 timeout, 4 ended).
+// ExitError makes main exit with Code without printing anything: 1 after a tool error (already printed),
+// follow.WaitTimeout / follow.WaitEnded from wait and run --until.
 type ExitError struct{ Code int }
 
 func (e ExitError) Error() string { return fmt.Sprintf("exit %d", e.Code) }
 
 type root struct {
-	Start  startCmd  `cmd:"" help:"Start a tail job."`
+	Start  startCmd  `cmd:"" help:"Start a job: tail a file or run a command (tail_start)."`
 	RunCmd runCmd    `cmd:"" name:"run" help:"Run a long-running command as a job; optionally notify, or block until a line matches."`
-	Stop   stopCmd   `cmd:"" help:"Stop a job."`
-	Jobs   jobsCmd   `cmd:"" help:"List jobs."`
-	Read   readCmd   `cmd:"" help:"Read a job's lines."`
-	Search searchCmd `cmd:"" help:"Full-text search (FTS5), newest first."`
-	SQL    sqlCmd    `cmd:"" name:"sql" help:"Read-only SQL over the jobs and lines tables."`
+	Stop   stopCmd   `cmd:"" help:"Stop a job (tail_stop)."`
+	Jobs   jobsCmd   `cmd:"" help:"List jobs (tail_jobs)."`
+	Read   readCmd   `cmd:"" help:"Read a job's lines (tail_read)."`
+	Search searchCmd `cmd:"" help:"Full-text search (FTS5), newest first (tail_search)."`
+	SQL    sqlCmd    `cmd:"" name:"sql" help:"Read-only SQL over the jobs, lines and notifiers tables (tail_sql)."`
 	Follow followCmd `cmd:"" help:"Stream digests of a job's new lines until it ends."`
 	Wait   waitCmd   `cmd:"" help:"Wait for a matching line (exit 0; 3 on timeout; 4 if the job ended)."`
-	Notify notifyCmd `cmd:"" help:"Start a detached follower that pushes digests to an agent."`
+	Notify notifyCmd `cmd:"" help:"Push digests of a job to this T3 thread (tail_notify)."`
 	MCP    mcpCmd    `cmd:"" name:"mcp" help:"Run the stdio MCP server."`
 	Tool   toolCmd   `cmd:"" hidden:"" help:"Run one MCP tool (tail-mode tool --list | tail-mode tool NAME [JSON|-] [--client pi])."`
 	Job    jobCmd    `cmd:"" name:"_job" hidden:"" help:"Internal: run a job's worker."`
@@ -75,124 +76,84 @@ func Run(args []string) error {
 	return ctx.Run()
 }
 
-// ---- start / run / stop / jobs / _job
+// ---- tool commands
 
-// Seams for tests: real jobs and notifiers detach processes (and a notifier can wake a T3 thread).
-var (
-	startJob      = jobs.Start
-	startNotifier = follow.StartNotifier
-)
+// toolCommand is a command that is one tool call: its flags mapped onto that tool's args.
+type toolCommand interface {
+	tool() (name string, args any)
+}
 
-// ownerOpt scopes a command to one owner: job names resolve among that owner's jobs, and new jobs
-// get it. In T3 it defaults to the thread id, so each agent thread has its own namespace.
+func runTool(c toolCommand) error {
+	_, err := call(c.tool())
+	return err
+}
+
+// call runs tool name as the CLI client and prints its text. A tool error goes to stderr (exit 1); a
+// wait's timeout or job end becomes its exit code.
+func call(name string, args any) (tools.Result, error) {
+	raw, err := json.Marshal(args)
+	if err != nil {
+		return tools.Result{}, err
+	}
+	ctx, stop := signalCtx()
+	defer stop()
+	r, err := tools.Exec(ctx, tools.CLI, name, raw)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return r, ExitError{Code: 1}
+	}
+	if _, err := io.WriteString(stdout, r.Text); err != nil {
+		return r, err
+	}
+	if r.Code != 0 {
+		return r, ExitError{Code: r.Code}
+	}
+	return r, nil
+}
+
+// ownerOpt scopes a command to one owner: job names resolve among its jobs, and new jobs get it. In T3 it
+// defaults to the thread id, so each agent thread has its own namespace.
 type ownerOpt struct {
 	Owner string `default:"${owner}" placeholder:"O" help:"Job owner: names resolve among its jobs, new jobs get it (default $T3CODE_THREAD_ID; '' = shared namespace)."`
 }
 
+func (o ownerOpt) caller() tools.Caller { return tools.Caller{Owner: o.Owner} }
+
 // cmdOpts are the cmd source's options, shared by start and run.
 type cmdOpts struct {
-	Dir   string   `placeholder:"D" help:"With a command: working dir (default: the current dir; remote: home). Quote '~/x' so it is the target's home."`
-	Env   []string `placeholder:"K=V" sep:"none" help:"With a command: export K=V before it (repeatable). PYTHONUNBUFFERED=1 is set unless given."`
-	Shell string   `placeholder:"S" help:"With a command: POSIX shell to run it with, name or absolute path (default bash)."`
-	Login bool     `help:"With a command: run it in a login shell (-lc), so profile files set PATH."`
+	Dir   string            `placeholder:"D" help:"With a command: working dir (default: the current dir; remote: home). Quote '~/x' so it is the target's home."`
+	Env   map[string]string `placeholder:"K=V" mapsep:"none" help:"With a command: export K=V before it (repeatable). PYTHONUNBUFFERED=1 is set unless given."`
+	Shell string            `placeholder:"S" help:"With a command: POSIX shell to run it with, name or absolute path (default bash)."`
+	Login bool              `help:"With a command: run it in a login shell (-lc), so profile files set PATH."`
 }
 
-// spec adds the cmd options to in (--env split at the first "=") and builds the source spec, with the
-// builder's errors reworded in flag names.
-func (o cmdOpts) spec(in source.SpecInput) (source.Spec, error) {
-	in.Dir, in.Shell, in.Login = o.Dir, o.Shell, o.Login
-	for _, kv := range o.Env {
-		k, v, ok := strings.Cut(kv, "=")
-		if !ok {
-			return source.Spec{}, fmt.Errorf("--env %q: want K=V", kv)
-		}
-		if in.Env == nil {
-			in.Env = map[string]string{}
-		}
-		in.Env[k] = v
-	}
-	sp, err := in.Spec()
-	switch {
-	case errors.Is(err, source.ErrBacklogNeedsFile):
-		err = errors.New("--backlog needs --file")
-	case errors.Is(err, source.ErrConfigNeedsSource):
-		err = errors.New("--config needs --source")
-	case errors.Is(err, source.ErrCmdOptionsNeedCmd):
-		err = errors.New("--dir, --env, --shell and --login need --cmd (with --source, put them in --config)")
-	case errors.Is(err, source.ErrConfigInvalidJSON):
-		err = errors.New("--config is not valid JSON")
-	}
-	return sp, err
-}
-
-// startOpts are StartOpts for a job on host ("" = local) started from this process's cwd.
-func startOpts(name, owner, host string, sp source.Spec) jobs.StartOpts {
-	o := jobs.StartOpts{Name: name, Owner: owner, Spec: sp}
-	if host != "" {
-		o.Transport, o.Target = "ssh", host
-	}
-	o.Cwd, _ = os.Getwd() // "" if unavailable: relative local paths are then refused
-	return o
-}
-
-// start starts the job and prints it.
-func start(s *store.Store, o jobs.StartOpts, asJSON bool) (store.Job, error) {
-	j, err := startJob(s, o)
-	if err != nil {
-		return j, err
-	}
-	if asJSON {
-		return j, printJSON(j)
-	}
-	fmt.Fprintf(stdout, "%s started (pid %d): %s\n", j.Label(), j.PID, store.OneLine(j.Describe))
-	return j, nil
+func (o cmdOpts) set(in *tools.StartIn) {
+	in.Dir, in.Env, in.Shell, in.Login = o.Dir, o.Env, o.Shell, o.Login
 }
 
 type startCmd struct {
-	Name      string `placeholder:"N" help:"Job name (reference it instead of the id)."`
-	Host      string `placeholder:"H" help:"SSH host; sugar for --transport ssh --target H." xor:"host-transport,host-target"`
-	Transport string `placeholder:"T" help:"Transport (default local)." xor:"host-transport"`
-	Target    string `placeholder:"X" help:"Transport target (e.g. an ssh host)." xor:"host-target"`
-	Restart   *bool  `negatable:"" help:"Restart when the source ends (default depends on the source)."`
-	File      string `placeholder:"PATH" help:"File to tail; sugar for --source file. Quote '~/x' so it is the target's home." xor:"source" required:""`
-	Backlog   *int   `placeholder:"N" help:"With --file: lines of history to read first (default 50)."`
-	Cmd       string `placeholder:"CMD" help:"Command to run; sugar for --source cmd." xor:"source" required:""`
-	Source    string `placeholder:"KIND" help:"Source kind." xor:"source" required:""`
-	Config    string `placeholder:"JSON" help:"With --source: adapter config as JSON."`
-	cmdOpts   `embed:""`
-	ownerOpt  `embed:""`
-	JSON      bool `name:"json" help:"JSON output."`
+	Name     string `placeholder:"N" help:"Job name (reference it instead of the id)."`
+	Host     string `placeholder:"H" help:"SSH host to run on (default local)."`
+	Restart  *bool  `negatable:"" help:"Restart when the source ends (default: file yes, cmd no)."`
+	File     string `placeholder:"PATH" help:"File to tail; sugar for --source file. Quote '~/x' so it is the target's home." xor:"source" required:""`
+	Backlog  *int   `placeholder:"N" help:"With --file: lines of history to read first (default 50)."`
+	Cmd      string `placeholder:"CMD" help:"Command to run; sugar for --source cmd." xor:"source" required:""`
+	Source   string `placeholder:"KIND" help:"Source kind." xor:"source" required:""`
+	Config   string `placeholder:"JSON" help:"With --source: adapter config as JSON."`
+	cmdOpts  `embed:""`
+	ownerOpt `embed:""`
 }
 
-// opts turns the flags (and their sugar) into jobs.StartOpts.
-func (c *startCmd) opts() (jobs.StartOpts, error) {
-	in := source.SpecInput{CmdConfig: source.CmdConfig{Cmd: c.Cmd}, File: c.File, Backlog: c.Backlog, Source: c.Source, Restart: c.Restart}
+func (c *startCmd) Run() error { return runTool(c) }
+
+func (c *startCmd) tool() (string, any) {
+	in := tools.StartIn{Caller: c.caller(), File: c.File, Cmd: c.Cmd, Source: c.Source, Host: c.Host, Name: c.Name,
+		Backlog: c.Backlog, Restart: c.Restart}
 	if c.Config != "" {
-		in.Config = json.RawMessage(c.Config)
+		in.Config = c.Config // JSON text: the tool parses it
 	}
-	sp, err := c.cmdOpts.spec(in)
-	if err != nil {
-		return jobs.StartOpts{}, err
-	}
-	o := startOpts(c.Name, c.Owner, c.Host, sp)
-	if c.Host == "" {
-		o.Transport, o.Target = c.Transport, c.Target
-	}
-	return o, nil
-}
-
-func (c *startCmd) Run() error {
-	o, err := c.opts()
-	if err != nil {
-		return err
-	}
-	s, err := store.Open("")
-	if err != nil {
-		return err
-	}
-	defer s.Close()
-	_, err = start(s, o, c.JSON)
-	return err
+	c.set(&in)
+	return "tail_start", in
 }
 
 type runCmd struct {
@@ -200,279 +161,141 @@ type runCmd struct {
 	Host     string `placeholder:"H" help:"Run over ssh on this host (default local)."`
 	cmdOpts  `embed:""`
 	ownerOpt `embed:""`
-	Every    time.Duration `placeholder:"${every}" help:"Notify with digests this often (starts a notifier; min 5s)."`
-	Match    string        `placeholder:"RE" help:"Notify only on lines matching this regex (starts a notifier; default every ${every})."`
-	MaxLines int           `default:"${maxLines}" help:"Lines per digest."`
-	Deliver  string        `xor:"dest" help:"Notifier sink, e.g. t3:THREAD (default t3:$T3CODE_THREAD_ID)." placeholder:"SPEC"`
-	Thread   string        `xor:"dest" help:"T3 thread id for the notifier (default $T3CODE_THREAD_ID)." placeholder:"ID"`
+	Every    string        `placeholder:"${every}" help:"Notify with digests this often, from the job's first line (min 5s)."`
+	Match    string        `placeholder:"RE" help:"Notify only on lines matching this regex (default every ${every})."`
 	Until    string        `placeholder:"RE" help:"Block until a line matches (exit 0; 3 on timeout; 4 if the job ended). The job keeps running."`
 	Timeout  time.Duration `default:"30m" help:"With --until: give up after this long (exit 3)."`
-	JSON     bool          `name:"json" help:"JSON output."`
 	Argv     []string      `arg:"" passthrough:"" placeholder:"CMD" help:"The command, after --. One argument is used verbatim as a shell command; several are shell-quoted and joined."`
 }
 
-// command is the shell command for argv: a single argument verbatim (so `run -- 'a | b'` works),
-// several shell-quoted and joined.
-func command(argv []string) string {
-	if len(argv) == 1 {
-		return argv[0]
-	}
-	return shellescape.QuoteCommand(argv)
-}
-
-func (c *runCmd) Run() error {
+// tool is tail_start for the command in Argv: one argument verbatim (so `run -- 'a | b'` works), several
+// shell-quoted and joined.
+func (c *runCmd) tool() (string, any) {
 	argv := c.Argv
 	if len(argv) > 0 && argv[0] == "--" {
 		argv = argv[1:]
 	}
-	if len(argv) == 0 {
-		return errors.New("run: no command (tail-mode run [flags] -- CMD...)")
+	cmd := shellescape.QuoteCommand(argv)
+	if len(argv) == 1 {
+		cmd = argv[0]
 	}
-	until, err := compile(c.Until)
-	if err != nil {
-		return err
-	}
-	wantNotify := c.Every != 0 || c.Match != ""
-	if !wantNotify && (c.Deliver != "" || c.Thread != "") {
-		return errors.New("--deliver/--thread need --every or --match")
-	}
-	// After 0: the job is new, so the notifier sees all of its lines, including fast early output.
-	n := follow.Options{Every: c.Every, Match: c.Match, MaxLines: c.MaxLines, After: 0}
-	if err := n.Validate(); wantNotify && err != nil { // before starting, so a bad flag leaves no job
-		return err
-	}
-	sp, err := c.cmdOpts.spec(source.SpecInput{CmdConfig: source.CmdConfig{Cmd: command(argv)}})
-	if err != nil {
-		return err
-	}
-	s, err := store.Open("")
-	if err != nil {
-		return err
-	}
-	defer s.Close()
-	j, err := start(s, startOpts(c.Name, c.Owner, c.Host, sp), c.JSON)
-	if err != nil {
-		return err
-	}
-	if wantNotify {
-		if err := c.notify(s, j.ID, n); err != nil {
-			return err
-		}
-	}
-	if until == nil {
-		return nil
-	}
-	// After 0, not -1: jobs.Start returns after the worker claims the job, so a fast "ready" line may
-	// already be stored.
-	return wait(s, j, until, c.Timeout, 0, c.JSON)
+	in := tools.StartIn{Caller: c.caller(), Cmd: cmd, Host: c.Host, Name: c.Name, NotifyEvery: c.Every, NotifyMatch: c.Match}
+	c.set(&in)
+	return "tail_start", in
 }
 
-// notify starts run's notifier for job (deliver resolved like notify), or prints the recipe when
-// there is no destination.
-func (c *runCmd) notify(s *store.Store, job string, n follow.Options) error {
-	var msg string
-	if n.Deliver = resolveDeliver(c.Deliver, c.Thread); n.Deliver == "" {
-		msg = "No T3 thread; to get woken:\n- " + strings.Join(tools.RecipeLines(job, n), "\n- ")
-	} else {
-		pid, err := startNotifier(s, job, n)
-		if err != nil {
-			return fmt.Errorf("job %s started, but its notifier did not: %w", job, err)
-		}
-		msg = fmt.Sprintf("notifier pid %d: digests every %s to %s", pid, n.Every, n.Deliver)
+// wait is tail_wait on the started job from cursor 0: the job is new, and jobs.Start returns after the
+// worker claimed it, so a fast "ready" line may already be stored.
+func (c *runCmd) wait(job string) tools.WaitIn {
+	after := int64(0)
+	return tools.WaitIn{Caller: c.caller(), Job: job, Until: c.Until, Timeout: c.Timeout.String(), After: &after}
+}
+
+func (c *runCmd) Run() error {
+	if _, err := regexp.Compile(c.Until); err != nil { // before starting, so a bad flag leaves no job
+		return fmt.Errorf("--until: %w", err)
 	}
-	if c.JSON {
-		return printJSON(map[string]string{"notify": msg})
+	r, err := call(c.tool())
+	if err != nil || c.Until == "" {
+		return err
 	}
-	fmt.Fprintln(stdout, msg)
-	return nil
+	_, err = call("tail_wait", c.wait(r.Job))
+	return err
 }
 
 type stopCmd struct {
 	Job      string `arg:"" help:"Job id or name."`
 	Force    bool   `help:"Stop it even if it is another owner's job."`
 	ownerOpt `embed:""`
-	JSON     bool `name:"json" help:"JSON output."`
 }
 
-func (c *stopCmd) Run() error {
-	s, err := store.Open("")
-	if err != nil {
-		return err
-	}
-	defer s.Close()
-	j, err := jobs.Stop(s, c.Job, c.Owner, c.Force)
-	if noe := (*jobs.NotOwnerError)(nil); errors.As(err, &noe) {
-		return fmt.Errorf("%w; pass --force to stop it anyway", err)
-	}
-	if err != nil {
-		return err
-	}
-	if c.JSON {
-		return printJSON(j)
-	}
-	fmt.Fprintf(stdout, "%s %s\n", j.Label(), j.StatusText())
-	return nil
+func (c *stopCmd) Run() error { return runTool(c) }
+
+func (c *stopCmd) tool() (string, any) {
+	return "tail_stop", tools.StopIn{Caller: c.caller(), Job: c.Job, Force: c.Force}
 }
 
 type jobsCmd struct {
 	All      bool `help:"Every owner's jobs, not just --owner's."`
 	ownerOpt `embed:""`
-	JSON     bool `name:"json" help:"JSON output."`
 }
 
-func (c *jobsCmd) Run() error {
-	s, err := store.Open("")
-	if err != nil {
-		return err
-	}
-	defer s.Close()
-	js, err := jobs.List(s, c.Owner, c.All)
-	if err != nil {
-		return err
-	}
-	if c.JSON {
-		if js == nil {
-			js = []store.Job{}
-		}
-		return printJSON(js)
-	}
-	tw := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprint(tw, "ID\tNAME\tSTATUS\tLINES\tLAST\tSOURCE")
-	if c.All {
-		fmt.Fprint(tw, "\tOWNER")
-	}
-	fmt.Fprintln(tw)
-	for _, j := range js {
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\t%s", j.ID, store.OneLine(j.Name), store.Clip(j.StatusText(), 60), j.Lines,
-			store.Ago(j.LastTS, "-"), store.OneLine(j.Describe))
-		if c.All {
-			fmt.Fprintf(tw, "\t%s", j.Owner)
-		}
-		fmt.Fprintln(tw)
-	}
-	return tw.Flush()
-}
+func (c *jobsCmd) Run() error { return runTool(c) }
 
-type jobCmd struct {
-	ID string `arg:""`
+func (c *jobsCmd) tool() (string, any) {
+	return "tail_jobs", tools.JobsIn{Caller: c.caller(), All: c.All}
 }
-
-func (c *jobCmd) Run() error {
-	s, err := store.Open("")
-	if err != nil {
-		return err
-	}
-	defer s.Close()
-	return jobs.Run(s, c.ID)
-}
-
-// ---- read / search / sql
 
 type readCmd struct {
 	Job      string `arg:"" help:"Job id or name."`
 	After    int64  `help:"Only lines with id > ID (exclusive cursor)." placeholder:"ID"`
 	Tail     int    `help:"Newest N lines." placeholder:"N"`
 	Grep     string `help:"Only lines matching this regex." placeholder:"RE"`
-	Limit    int    `default:"200" help:"Max lines."`
+	Limit    int    `help:"Max lines (default 200)." placeholder:"N"`
 	ownerOpt `embed:""`
-	JSON     bool `name:"json" help:"JSON output."`
 }
 
-func (c *readCmd) Run() error {
-	re, err := compile(c.Grep)
-	if err != nil {
-		return err
-	}
-	s, j, err := openJob(c.Job, c.Owner)
-	if err != nil {
-		return err
-	}
-	defer s.Close()
-	lines, err := s.Read(store.ReadQuery{Job: j.ID, After: c.After, Tail: c.Tail, Grep: re, Limit: c.Limit})
-	if err != nil {
-		return err
-	}
-	return printLines(lines, c.JSON, false)
+func (c *readCmd) Run() error { return runTool(c) }
+
+func (c *readCmd) tool() (string, any) {
+	return "tail_read", tools.ReadIn{Caller: c.caller(), Job: c.Job, After: c.After, Tail: c.Tail, Grep: c.Grep, Limit: c.Limit}
 }
 
 type searchCmd struct {
 	Query    []string `arg:"" help:"FTS5 query (words are joined with spaces)."`
 	Job      string   `help:"Only this job (id, or name among --owner's jobs)."`
 	All      bool     `help:"Every owner's jobs, not just --owner's."`
+	Since    string   `help:"Only lines newer than this, e.g. 1h." placeholder:"D"`
+	Limit    int      `help:"Max lines (default 50)." placeholder:"N"`
 	ownerOpt `embed:""`
-	Since    time.Duration `help:"Only lines newer than this, e.g. 1h."`
-	Limit    int           `default:"50" help:"Max lines."`
-	JSON     bool          `name:"json" help:"JSON output."`
 }
 
-func (c *searchCmd) Run() error {
-	s, err := store.Open("")
-	if err != nil {
-		return err
-	}
-	defer s.Close()
-	q := store.SearchQuery{Query: strings.Join(c.Query, " "), Limit: c.Limit, Owner: c.Owner, All: c.All}
-	if c.Job != "" {
-		j, err := s.GetJob(c.Job, c.Owner)
-		if err != nil {
-			return err
-		}
-		q.Job = j.ID
-	}
-	if c.Since > 0 {
-		q.SinceTS = time.Now().Add(-c.Since).UnixMilli()
-	}
-	lines, err := s.Search(q)
-	if err != nil {
-		return err
-	}
-	return printLines(lines, c.JSON, q.Job == "")
+func (c *searchCmd) Run() error { return runTool(c) }
+
+func (c *searchCmd) tool() (string, any) {
+	return "tail_search", tools.SearchIn{Caller: c.caller(), Query: strings.Join(c.Query, " "), Job: c.Job, All: c.All, Since: c.Since, Limit: c.Limit}
 }
 
 type sqlCmd struct {
-	Query   []string      `arg:"" help:"One read-only SQL statement (words are joined with spaces)."`
-	Limit   int           `default:"500" help:"Max rows."`
-	Timeout time.Duration `default:"5s" help:"Stop the query after this long."`
-	JSON    bool          `name:"json" help:"JSON output."`
+	Query []string `arg:"" help:"One read-only SELECT (words are joined with spaces)."`
+	Limit int      `help:"Max rows (default 500)." placeholder:"N"`
 }
 
-func (c *sqlCmd) Run() error {
-	s, err := store.Open("")
-	if err != nil {
-		return err
-	}
-	defer s.Close()
-	ctx := context.Background()
-	if c.Timeout > 0 { // else store.Query applies its default
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, c.Timeout)
-		defer cancel()
-	}
-	cols, rows, err := s.Query(ctx, strings.Join(c.Query, " "), c.Limit)
-	if err != nil {
-		return err
-	}
-	if c.JSON {
-		if rows == nil {
-			rows = [][]any{}
-		}
-		return json.NewEncoder(stdout).Encode(map[string]any{"columns": cols, "rows": rows})
-	}
-	fmt.Fprintln(stdout, strings.Join(cols, "\t"))
-	flat := strings.NewReplacer("\t", " ", "\n", " ")
-	for _, r := range rows {
-		cells := make([]string, len(r))
-		for i, v := range r {
-			if v != nil {
-				cells[i] = flat.Replace(fmt.Sprint(v))
-			}
-		}
-		fmt.Fprintln(stdout, strings.Join(cells, "\t"))
-	}
-	return nil
+func (c *sqlCmd) Run() error { return runTool(c) }
+
+func (c *sqlCmd) tool() (string, any) {
+	return "tail_sql", tools.SQLIn{Query: strings.Join(c.Query, " "), Limit: c.Limit}
 }
 
-// ---- follow / wait / notify / mcp
+type waitCmd struct {
+	Job      string        `arg:"" help:"Job id or name."`
+	Until    string        `required:"" help:"Regex to wait for." placeholder:"RE"`
+	Timeout  time.Duration `default:"30m" help:"Give up after this long (exit 3)."`
+	After    int64         `default:"-1" help:"Start cursor (-1 = the job's current end)." placeholder:"ID"`
+	ownerOpt `embed:""`
+}
+
+func (c *waitCmd) Run() error { return runTool(c) }
+
+func (c *waitCmd) tool() (string, any) {
+	return "tail_wait", tools.WaitIn{Caller: c.caller(), Job: c.Job, Until: c.Until, Timeout: c.Timeout.String(), After: &c.After}
+}
+
+type notifyCmd struct {
+	Job      string `arg:"" help:"Job id or name."`
+	Every    string `placeholder:"${every}" help:"Digest interval (min 5s)."`
+	Match    string `help:"Only notify on lines matching this regex." placeholder:"RE"`
+	After    *int64 `help:"Start cursor (default: the job's current end; 0 = its first line)." placeholder:"ID"`
+	ownerOpt `embed:""`
+}
+
+func (c *notifyCmd) Run() error { return runTool(c) }
+
+func (c *notifyCmd) tool() (string, any) {
+	return "tail_notify", tools.NotifyIn{Caller: c.caller(), Job: c.Job, Every: c.Every, Match: c.Match, After: c.After}
+}
+
+// ---- commands with no tool
 
 type followCmd struct {
 	Job      string        `arg:"" help:"Job id or name."`
@@ -481,7 +304,7 @@ type followCmd struct {
 	MaxLines int           `default:"${maxLines}" help:"Lines per digest."`
 	After    int64         `default:"-1" help:"Start cursor (-1 = the job's current end)." placeholder:"ID"`
 	Deliver  string        `default:"stdout" help:"Sink: stdout | jsonl | t3:THREAD."`
-	Notifier bool          `hidden:"" help:"Internal: register as the one notifier for this job and --deliver (set by notify)."`
+	Notifier bool          `hidden:"" help:"Internal: register as the one notifier for this job and --deliver (set by tail_notify)."`
 	ownerOpt `embed:""`
 }
 
@@ -490,11 +313,15 @@ func (c *followCmd) Run() error {
 	if err != nil {
 		return err
 	}
-	s, j, err := openJob(c.Job, c.Owner)
+	s, err := store.Open("")
 	if err != nil {
 		return err
 	}
 	defer s.Close()
+	j, err := s.GetJob(c.Job, c.Owner)
+	if err != nil {
+		return err
+	}
 	if c.Notifier {
 		release, err := follow.Register(s, j.ID, c.Deliver)
 		if err != nil {
@@ -511,91 +338,17 @@ func (c *followCmd) Run() error {
 	return err
 }
 
-type waitCmd struct {
-	Job      string        `arg:"" help:"Job id or name."`
-	Until    string        `required:"" help:"Regex to wait for." placeholder:"RE"`
-	Timeout  time.Duration `default:"30m" help:"Give up after this long (exit 3)."`
-	After    int64         `default:"-1" help:"Start cursor (-1 = the job's current end)." placeholder:"ID"`
-	ownerOpt `embed:""`
-	JSON     bool `name:"json" help:"JSON output."`
+type jobCmd struct {
+	ID string `arg:""`
 }
 
-func (c *waitCmd) Run() error {
-	re, err := regexp.Compile(c.Until)
-	if err != nil {
-		return err
-	}
-	s, j, err := openJob(c.Job, c.Owner)
+func (c *jobCmd) Run() error {
+	s, err := store.Open("")
 	if err != nil {
 		return err
 	}
 	defer s.Close()
-	return wait(s, j, re, c.Timeout, c.After, c.JSON)
-}
-
-// wait blocks until a line of j after cursor after matches until and prints the matches; a timeout or
-// the job's end becomes an ExitError with follow's wait code.
-func wait(s *store.Store, j store.Job, until *regexp.Regexp, timeout time.Duration, after int64, asJSON bool) error {
-	ctx, stop := signalCtx()
-	defer stop()
-	lines, code, _, err := follow.WaitCursor(ctx, s, j, until, timeout, after)
-	if err != nil {
-		return err
-	}
-	if code != 0 {
-		return ExitError{Code: code}
-	}
-	return printLines(lines, asJSON, false)
-}
-
-type notifyCmd struct {
-	Job      string        `arg:"" help:"Job id or name."`
-	Every    time.Duration `default:"${every}" help:"Poll interval (min 5s)."`
-	Match    string        `help:"Only notify on lines matching this regex." placeholder:"RE"`
-	MaxLines int           `default:"${maxLines}" help:"Lines per digest."`
-	After    int64         `default:"-1" help:"Start cursor (-1 = the job's current end)." placeholder:"ID"`
-	Deliver  string        `xor:"dest" help:"Sink spec, e.g. t3:THREAD." placeholder:"SPEC"`
-	Thread   string        `xor:"dest" help:"T3 thread id (default $T3CODE_THREAD_ID)." placeholder:"ID"`
-	ownerOpt `embed:""`
-}
-
-// resolveDeliver resolves where digests go: deliverFlag, else T3 via thread or $T3CODE_THREAD_ID, else "".
-func resolveDeliver(deliverFlag, thread string) string {
-	if deliverFlag != "" {
-		return deliverFlag
-	}
-	if thread == "" {
-		thread = tools.EnvThread()
-	}
-	if thread == "" {
-		return ""
-	}
-	return "t3:" + thread
-}
-
-func (c *notifyCmd) deliverSpec() (string, error) {
-	if spec := resolveDeliver(c.Deliver, c.Thread); spec != "" {
-		return spec, nil
-	}
-	return "", errors.New("notify: nowhere to deliver (--deliver SPEC, --thread ID, or $T3CODE_THREAD_ID)")
-}
-
-func (c *notifyCmd) Run() error {
-	spec, err := c.deliverSpec()
-	if err != nil {
-		return err
-	}
-	s, j, err := openJob(c.Job, c.Owner)
-	if err != nil {
-		return err
-	}
-	defer s.Close()
-	pid, err := startNotifier(s, j.ID, follow.Options{Every: c.Every, Match: c.Match, MaxLines: c.MaxLines, After: c.After, Deliver: spec})
-	if err != nil {
-		return err
-	}
-	fmt.Fprintln(stdout, pid)
-	return nil
+	return jobs.Run(s, c.ID)
 }
 
 type mcpCmd struct{}
@@ -616,8 +369,9 @@ type toolCmd struct {
 }
 
 func (c *toolCmd) Run() error {
+	enc := json.NewEncoder(stdout)
 	if c.List {
-		return printJSON(tools.List())
+		return enc.Encode(tools.List())
 	}
 	args := []byte(c.Args)
 	if c.Args == "-" {
@@ -626,64 +380,24 @@ func (c *toolCmd) Run() error {
 			return err
 		}
 	}
+	client := tools.MCP
+	if c.Client == "pi" {
+		client = tools.Pi
+	}
 	ctx, stop := signalCtx()
 	defer stop()
-	r, err := tools.Exec(ctx, c.Name, args, c.Client == "pi")
+	r, err := tools.Exec(ctx, client, c.Name, args)
 	switch {
 	case err != nil:
 		fmt.Fprintln(stdout, err)
 		return ExitError{Code: 1}
-	case c.Client == "pi":
-		return printJSON(r)
+	case client.Pi:
+		return enc.Encode(r)
 	}
 	_, err = io.WriteString(stdout, r.Text)
 	return err
 }
 
-// ---- helpers
-
 func signalCtx() (context.Context, context.CancelFunc) {
 	return signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
-}
-
-// openJob opens the store and resolves ref (an id, or a name among owner's jobs).
-func openJob(ref, owner string) (*store.Store, store.Job, error) {
-	s, err := store.Open("")
-	if err != nil {
-		return nil, store.Job{}, err
-	}
-	j, err := s.GetJob(ref, owner)
-	if err != nil {
-		s.Close()
-		return nil, j, err
-	}
-	return s, j, nil
-}
-
-func compile(re string) (*regexp.Regexp, error) {
-	if re == "" {
-		return nil, nil
-	}
-	return regexp.Compile(re)
-}
-
-// printJSON prints v as one line of compact JSON (agents parse it).
-func printJSON(v any) error { return json.NewEncoder(stdout).Encode(v) }
-
-func printLines(lines []store.Line, asJSON, withJob bool) error {
-	if asJSON {
-		if lines == nil {
-			lines = []store.Line{}
-		}
-		return printJSON(lines)
-	}
-	for _, l := range lines {
-		ts := store.Clock(l.TS)
-		if withJob {
-			fmt.Fprintf(stdout, "%d %s %s %s\n", l.ID, l.Job, ts, l.Text)
-		} else {
-			fmt.Fprintf(stdout, "%d %s %s\n", l.ID, ts, l.Text)
-		}
-	}
-	return nil
 }

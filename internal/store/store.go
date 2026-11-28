@@ -154,6 +154,9 @@ func (s *Store) Close() error { return s.db.Close() }
 // Path is the database file path (for read-only connections opened elsewhere).
 func (s *Store) Path() string { return filepath.Join(s.Dir, DBFile) }
 
+// JobLock is a job worker's liveness lock: <dir>/run/<id>.lock.
+func (s *Store) JobLock(id string) string { return filepath.Join(s.Dir, "run", id+".lock") }
+
 func NowMS() int64 { return time.Now().UnixMilli() }
 
 // NewJobID returns "j" + 6 hex chars.

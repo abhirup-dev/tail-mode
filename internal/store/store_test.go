@@ -2,9 +2,11 @@ package store
 
 import (
 	"errors"
+	"fmt"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 )
 
@@ -88,6 +90,68 @@ func TestGetJobEmptyRef(t *testing.T) {
 	}
 	if j, _ := s.GetJob("j2", ""); j.ID != "j2" {
 		t.Fatalf("by id: %s", j.ID)
+	}
+}
+
+// Names resolve within an owner (ids across owners); search is owner-scoped unless all or job, and since
+// drops older lines.
+func TestOwnersAndSearch(t *testing.T) {
+	s := open(t)
+	for i, o := range []string{"a", "b", ""} {
+		j := job(fmt.Sprintf("j%d", i), "web", "running")
+		j.Owner = o
+		s.CreateJob(j)
+		s.Append(j.ID, []string{"old hit " + o}, NowMS()-time.Hour.Milliseconds())
+		s.Append(j.ID, []string{"new hit " + o}, NowMS())
+	}
+	for ref, want := range map[string]string{"web": "j1", "j0": "j0"} {
+		if j, err := s.GetJob(ref, "b"); err != nil || j.ID != want {
+			t.Errorf("GetJob(%s, b) = %s %v, want %s", ref, j.ID, err, want)
+		}
+	}
+	if _, err := s.GetJob("web", "c"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("a third owner resolves web: %v", err)
+	}
+	if js, _ := s.ListJobs("a", false); len(js) != 1 || js[0].ID != "j0" {
+		t.Errorf("a lists %+v", js)
+	}
+	for _, c := range []struct {
+		q    SearchQuery
+		want int
+	}{
+		{SearchQuery{Query: "hit", Owner: "a"}, 2},
+		{SearchQuery{Query: "hit", Owner: ""}, 2},
+		{SearchQuery{Query: "hit", Owner: "a", All: true}, 6},
+		{SearchQuery{Query: "hit", Owner: "a", Job: "j1"}, 2},
+		{SearchQuery{Query: "hit", All: true, SinceTS: NowMS() - time.Minute.Milliseconds()}, 3},
+	} {
+		if hits, err := s.Search(c.q); err != nil || len(hits) != c.want {
+			t.Errorf("%+v: %d hits %v, want %d", c.q, len(hits), err, c.want)
+		}
+	}
+}
+
+// One notifier row per (job, deliver): set upserts the pid, delete only removes the row if the pid is
+// still the caller's (a replaced follower must not delete its successor's row).
+func TestNotifiers(t *testing.T) {
+	s := open(t)
+	s.SetNotifier("j1", "t3:x", 10)
+	s.SetNotifier("j1", "t3:x", 11)
+	s.SetNotifier("j1", "jsonl", 12)
+	s.SetNotifier("j2", "jsonl", 13)
+	s.DeleteNotifier("j1", "t3:x", 10)
+	if n, ok, err := s.GetNotifier("j1", "t3:x"); !ok || err != nil || n.PID != 11 {
+		t.Fatalf("get %+v %v %v", n, ok, err)
+	}
+	s.DeleteNotifier("j1", "t3:x", 11)
+	if _, ok, err := s.GetNotifier("j1", "t3:x"); ok || err != nil {
+		t.Fatalf("deleted row still there: %v", err)
+	}
+	if ns, _ := s.ListNotifiers("j1"); len(ns) != 1 || ns[0].PID != 12 {
+		t.Fatalf("list j1 %+v", ns)
+	}
+	if ns, _ := s.ListNotifiers(""); len(ns) != 2 {
+		t.Fatalf("list all %+v", ns)
 	}
 }
 

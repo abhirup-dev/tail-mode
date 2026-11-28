@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/abhirup-dev/tail-mode/internal/testutil"
 	"github.com/abhirup-dev/tail-mode/internal/transport"
 )
 
@@ -57,7 +58,7 @@ func TestSSHCancelLeavesNoRemoteProcess(t *testing.T) {
 		var c collector
 		done := make(chan error, 1)
 		go func() { done <- cmdSource(t, cmd).Stream(ctx, tr, false, c.emit) }()
-		waitFor(t, func() bool { return len(c.get()) == 1 })
+		testutil.WaitFor(t, 5*time.Second, func() bool { return len(c.get()) == 1 })
 		if remotePgrep(t, tr, marker) == "" {
 			t.Fatal("remote command not found while running")
 		}

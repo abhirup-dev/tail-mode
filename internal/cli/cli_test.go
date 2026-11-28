@@ -2,240 +2,141 @@ package cli
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/abhirup-dev/tail-mode/internal/follow"
 	"github.com/abhirup-dev/tail-mode/internal/store"
+	"github.com/abhirup-dev/tail-mode/internal/testutil"
 )
 
-func mustParse(t *testing.T, args ...string) *root {
-	t.Helper()
-	var r root
-	if _, err := parse(&r, args); err != nil {
-		t.Fatalf("%q: %v", args, err)
+// TestMain doubles as the detached children (proc.Detach re-execs this test binary): `_job <id>` job
+// workers and `follow …` notifiers. T3CODE_THREAD_ID is cleared so nothing here can reach a real
+// T3 thread, and so --owner defaults do not depend on where the tests run.
+func TestMain(m *testing.M) {
+	os.Unsetenv("T3CODE_THREAD_ID")
+	if len(os.Args) > 1 && (os.Args[1] == "_job" || os.Args[1] == "follow") {
+		if err := Run(os.Args[1:]); err != nil {
+			fmt.Fprintln(os.Stderr, "test child:", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
 	}
-	return &r
+	os.Exit(m.Run())
 }
 
-func parseErr(t *testing.T, args ...string) {
-	t.Helper()
-	if _, err := parse(&root{}, args); err == nil {
-		t.Fatalf("%q: want parse error", args)
-	}
-}
-
-func TestParseInterleavedAndDashDash(t *testing.T) {
-	for _, args := range [][]string{
-		{"read", "web", "--tail", "2", "--json"},
-		{"read", "--tail", "2", "web", "--json"},
-		{"read", "--json", "--tail=2", "web"},
+// Each job command is one tool call: its flags (interleaved with positionals, hyphenated values allowed)
+// map onto exactly these tool args. Defaults are the tool's, except the CLI's own (wait: 30m, from now).
+func TestFlagsToToolArgs(t *testing.T) {
+	t.Setenv("T3CODE_THREAD_ID", " T1\n") // the --owner default, trimmed
+	for _, c := range []struct {
+		args       []string
+		tool, json string
+	}{
+		{[]string{"start", "--file", "/x", "--backlog", "0", "--host", "vps", "--no-restart", "--name", "w"}, "tail_start",
+			`{"owner":"T1","file":"/x","host":"vps","name":"w","backlog":0,"restart":false}`},
+		{[]string{"start", "--source", "cmd", "--config", `{"cmd":"ls"}`, "--owner="}, "tail_start", `{"source":"cmd","config":"{\"cmd\":\"ls\"}"}`},
+		{[]string{"run", "--name", "web", "--dir", "/a", "--env", "A=b=c", "--env", "B=1;2", "--shell", "zsh", "--login",
+			"--every", "10s", "--match", "ERR", "--", "npm", "run", "a b"}, "tail_start",
+			`{"owner":"T1","cmd":"npm run 'a b'","dir":"/a","env":{"A":"b=c","B":"1;2"},"shell":"zsh","login":true,"name":"web","notify_every":"10s","notify_match":"ERR"}`},
+		{[]string{"run", "--host", "vps", "--", "make 2>&1 | tee log"}, "tail_start", `{"owner":"T1","cmd":"make 2\u003e\u00261 | tee log","host":"vps"}`},
+		{[]string{"stop", "web", "--force", "--owner", "x"}, "tail_stop", `{"owner":"x","job":"web","force":true}`},
+		{[]string{"jobs", "--all"}, "tail_jobs", `{"owner":"T1","all":true}`},
+		{[]string{"read", "--tail", "2", "web", "--grep", "-x", "--after=-1"}, "tail_read", `{"owner":"T1","job":"web","after":-1,"tail":2,"grep":"-x"}`},
+		{[]string{"search", "--since", "1h", "--", "-foo", "bar"}, "tail_search", `{"owner":"T1","query":"-foo bar","since":"1h"}`},
+		{[]string{"sql", "select", "1", "--limit", "5"}, "tail_sql", `{"query":"select 1","limit":5}`},
+		{[]string{"wait", "web", "--until", "ready"}, "tail_wait", `{"owner":"T1","job":"web","until":"ready","timeout":"30m0s","after":-1}`},
+		{[]string{"notify", "web"}, "tail_notify", `{"owner":"T1","job":"web"}`},
+		{[]string{"notify", "web", "--every", "10s", "--match", "E", "--after", "0"}, "tail_notify", `{"owner":"T1","job":"web","every":"10s","match":"E","after":0}`},
 	} {
-		r := mustParse(t, args...)
-		if r.Read.Job != "web" || r.Read.Tail != 2 || !r.Read.JSON || r.Read.Limit != 200 {
-			t.Fatalf("%q: %+v", args, r.Read)
-		}
-	}
-	r := mustParse(t, "search", "--limit", "5", "--", "-foo", "--json")
-	if strings.Join(r.Search.Query, " ") != "-foo --json" || r.Search.JSON || r.Search.Limit != 5 {
-		t.Fatalf("search: %+v", r.Search)
-	}
-	r = mustParse(t, "sql", "select 1", "--json")
-	if r.SQL.Query[0] != "select 1" || !r.SQL.JSON || r.SQL.Limit != 500 || r.SQL.Timeout.String() != "5s" {
-		t.Fatalf("sql: %+v", r.SQL)
-	}
-	for _, args := range [][]string{{"follow", "web", "--after", "-1"}, {"follow", "web", "--after=-1"}, {"follow", "web"}} {
-		if r := mustParse(t, args...); r.Follow.After != -1 {
-			t.Fatalf("%q: after %d", args, r.Follow.After)
-		}
-	}
-	if r := mustParse(t, "read", "web", "--grep", "-x"); r.Read.Grep != "-x" {
-		t.Fatalf("hyphen value: %+v", r.Read)
-	}
-	parseErr(t, "search", "-foo") // a hyphenated positional needs --
-	if r := mustParse(t, "follow", "--after=0", "--", "web"); r.Follow.After != 0 || r.Follow.Job != "web" {
-		t.Fatalf("notifier argv: %+v", r.Follow)
-	}
-	parseErr(t, "jobs", "--nope")
-	parseErr(t, "wait", "web") // --until required
-}
-
-func TestStartOpts(t *testing.T) {
-	opts := func(args ...string) (string, string, string, *bool, error) {
-		t.Helper()
-		r := mustParse(t, append([]string{"start"}, args...)...)
-		o, err := r.Start.opts()
-		return o.Spec.Kind + " " + string(o.Spec.Config), o.Transport, o.Target, o.Spec.Restart, err
-	}
-	if spec, tr, tg, rs, err := opts("--file", "/x", "--name", "w"); err != nil || spec != `file {"path":"/x"}` || tr != "" || tg != "" || rs != nil {
-		t.Fatalf("file: %s %s %s %v %v", spec, tr, tg, rs, err)
-	}
-	if spec, _, _, _, _ := opts("--file", "/x", "--backlog", "0"); spec != `file {"path":"/x","backlog":0}` {
-		t.Fatalf("backlog 0: %s", spec)
-	}
-	if spec, tr, tg, rs, _ := opts("--cmd", "make dev", "--host", "vps", "--no-restart"); spec != `cmd {"cmd":"make dev"}` || tr != "ssh" || tg != "vps" || rs == nil || *rs {
-		t.Fatalf("cmd: %s %s %s %v", spec, tr, tg, rs)
-	}
-	if _, tr, tg, rs, _ := opts("--source", "cmd", "--config", `{"cmd":"ls"}`, "--transport", "local", "--target", "t", "--restart"); tr != "local" || tg != "t" || rs == nil || !*rs {
-		t.Fatalf("source: %s %s %v", tr, tg, rs)
-	}
-	for _, bad := range [][]string{{"--cmd", "ls", "--backlog", "3"}, {"--file", "/x", "--config", "{}"}, {"--source", "cmd", "--config", "{nope"}} {
-		if _, _, _, _, err := opts(bad...); err == nil {
-			t.Fatalf("%q: want error", bad)
-		}
-	}
-	parseErr(t, "start")                                // no source
-	parseErr(t, "start", "--file", "/x", "--cmd", "ls") // two sources
-	parseErr(t, "start", "--file", "/x", "--host", "h", "--transport", "ssh")
-	parseErr(t, "start", "--file", "/x", "--host", "h", "--target", "h2")
-}
-
-func TestNotifyDeliverResolution(t *testing.T) {
-	t.Setenv("TAIL_MODE_HOME", t.TempDir())
-	t.Setenv("T3CODE_THREAD_ID", "")
-	if err := Run([]string{"notify", "web"}); err == nil || !strings.Contains(err.Error(), "nowhere to deliver") {
-		t.Fatalf("want resolution error before touching the job, got %v", err)
-	}
-	spec := func(args ...string) string {
-		t.Helper()
-		r := mustParse(t, append([]string{"notify", "web"}, args...)...)
-		s, err := r.Notify.deliverSpec()
+		ctx, err := parse(&root{}, c.args)
 		if err != nil {
-			t.Fatal(err)
+			t.Errorf("%q: %v", c.args, err)
+			continue
 		}
-		return s
+		tool, in := ctx.Selected().Target.Addr().Interface().(toolCommand).tool()
+		if b, _ := json.Marshal(in); tool != c.tool || string(b) != c.json {
+			t.Errorf("%q:\n got %s %s\nwant %s %s", c.args, tool, b, c.tool, c.json)
+		}
 	}
-	if s := spec("--thread", "T1"); s != "t3:T1" {
-		t.Fatal(s)
-	}
-	if s := spec("--deliver", "jsonl"); s != "jsonl" {
-		t.Fatal(s)
-	}
-	t.Setenv("T3CODE_THREAD_ID", "ENV")
-	if s := spec(); s != "t3:ENV" {
-		t.Fatal(s)
-	}
-	if s := spec("--thread", "T1"); s != "t3:T1" {
-		t.Fatal(s)
-	}
-	parseErr(t, "notify", "web", "--thread", "T1", "--deliver", "jsonl")
-}
-
-func TestReadAndSQL(t *testing.T) {
-	t.Setenv("TAIL_MODE_HOME", t.TempDir())
-	s, err := store.Open("")
-	if err != nil {
+	// run --until then waits on the new job from its first line.
+	var r root
+	if _, err := parse(&r, []string{"run", "--until", "ready", "--timeout", "1m", "--", "x"}); err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
-	j := store.Job{ID: store.NewJobID(), Name: "web", Kind: "cmd", Transport: "local", Spec: "{}", Status: "starting", StartedAt: store.NowMS()}
-	if err := s.CreateJob(j); err != nil {
-		t.Fatal(err)
+	if b, _ := json.Marshal(r.RunCmd.wait("j1")); string(b) != `{"owner":"T1","job":"j1","until":"ready","timeout":"1m0s","after":0}` {
+		t.Errorf("run --until: %s", b)
 	}
-	if err := s.Append(j.ID, []string{"a", "b", "c"}, store.NowMS()); err != nil {
-		t.Fatal(err)
+	// follow (no tool) parses the argv notifiers and Pi followers are started with.
+	o := follow.Options{Deliver: "jsonl", After: -1, Every: 30 * time.Second, MaxLines: 10, Match: "-x"}
+	if _, err := parse(&r, o.FollowArgs("web")); err != nil || r.Follow != (followCmd{Job: "web", Every: o.Every, Match: "-x", MaxLines: 10, After: -1,
+		Deliver: "jsonl", ownerOpt: ownerOpt{"T1"}}) {
+		t.Errorf("follow %v: %+v", err, r.Follow)
 	}
-	var buf bytes.Buffer
-	stdout = &buf
-	t.Cleanup(func() { stdout = os.Stdout })
-	if err := Run([]string{"read", "web", "--tail", "2"}); err != nil {
-		t.Fatal(err)
-	}
-	if got := buf.String(); strings.Count(got, "\n") != 2 || !strings.HasSuffix(got, " c\n") {
-		t.Fatalf("read %q", got)
-	}
-	buf.Reset()
-	if err := Run([]string{"sql", "select count(*) n from lines", "--json"}); err != nil {
-		t.Fatal(err)
-	}
-	if got := buf.String(); got != `{"columns":["n"],"rows":[[3]]}`+"\n" {
-		t.Fatalf("sql %q", got)
-	}
-	if err := Run([]string{"sql", "delete from lines"}); err == nil {
-		t.Fatal("sql must be read-only")
+	for _, bad := range [][]string{{"start"}, {"start", "--file", "/x", "--cmd", "ls"}, {"start", "--file", "/x", "--transport", "ssh"},
+		{"wait", "web"}, {"search", "-foo"}, {"jobs", "--json"}} {
+		if _, err := parse(&root{}, bad); err == nil {
+			t.Errorf("%q: want a parse error", bad)
+		}
 	}
 }
 
-// The CLI names its flag when refusing another owner's job.
-func TestStopForceWording(t *testing.T) {
-	t.Setenv("TAIL_MODE_HOME", t.TempDir())
-	s, err := store.Open("")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-	j := store.Job{ID: store.NewJobID(), Owner: "a", Kind: "cmd", Transport: "local", Spec: "{}", Status: "starting", StartedAt: store.NowMS()}
-	if err := s.CreateJob(j); err != nil {
-		t.Fatal(err)
-	}
-	if err := Run([]string{"stop", j.ID, "--owner", "b"}); err == nil || !strings.Contains(err.Error(), "pass --force") {
-		t.Fatalf("cross-owner stop: %v", err)
-	}
-}
-
-// --owner defaults to the trimmed $T3CODE_THREAD_ID (parse only: nothing runs), and --owner= selects the shared namespace.
-func TestOwnerFlag(t *testing.T) {
-	t.Setenv("T3CODE_THREAD_ID", " t-env\n")
-	if r := mustParse(t, "read", "web"); r.Read.Owner != "t-env" {
-		t.Fatalf("default owner %q", r.Read.Owner)
-	}
-	if r := mustParse(t, "stop", "web", "--owner", "x", "--force"); r.Stop.Owner != "x" || !r.Stop.Force {
-		t.Fatalf("stop %+v", r.Stop)
-	}
-	if r := mustParse(t, "jobs", "--owner=", "--all"); r.Jobs.Owner != "" || !r.Jobs.All {
-		t.Fatalf("jobs %+v", r.Jobs)
-	}
-	if r := mustParse(t, "search", "q", "--all"); !r.Search.All || r.Search.Owner != "t-env" {
-		t.Fatalf("search %+v", r.Search)
-	}
-}
-
-// The jobs table shows exit codes and keeps a multi-line command on one row.
-func TestJobsTable(t *testing.T) {
-	t.Setenv("TAIL_MODE_HOME", t.TempDir())
-	s, err := store.Open("")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-	for i, j := range []store.Job{
-		{ID: "j000001", Name: "a", Describe: "make test", StartedAt: 1},
-		{ID: "j000002", Name: "b", Describe: "echo one\necho two", StartedAt: 2},
+// Exit status: 0 ok; wait's follow.WaitTimeout and follow.WaitEnded; 1 for a tool error (stderr, or stdout
+// for the hidden tool command that Pi reads). run with a bad --until starts nothing.
+func TestExitCodes(t *testing.T) {
+	s := testutil.Store(t)
+	testutil.LiveJob(t, s, store.Job{Name: "live"}, "booting", "ready")
+	testutil.Job(t, s, store.Job{Name: "ended", Status: "exited"}, "bye")
+	var out bytes.Buffer
+	testutil.Swap[io.Writer](t, &stdout, &out)
+	for _, c := range []struct {
+		args []string
+		code int
+		out  string
+	}{
+		{[]string{"wait", "live", "--until", "ready", "--after", "0"}, 0, "wait: matched /ready/"},
+		{[]string{"wait", "live", "--until", "nope", "--timeout", "50ms"}, follow.WaitTimeout, "wait: timed out after 50ms"},
+		{[]string{"wait", "ended", "--until", "nope"}, follow.WaitEnded, "wait: job ended without a line matching /nope/"},
+		{[]string{"read", "nosuch"}, 1, ""},
+		{[]string{"run", "--until", "(", "--", "true"}, -1, ""},
+		{[]string{"tool", "tail_read", `{"job":"nosuch"}`}, 1, `error: no job "nosuch"`},
+		{[]string{"tool", "tail_jobs", "--client", "pi"}, 0, `{"text":"count: 2 jobs`},
 	} {
-		j.Kind, j.Transport, j.Spec, j.Status = "cmd", "local", "{}", "starting"
-		if err := s.CreateJob(j); err != nil {
-			t.Fatal(err)
+		out.Reset()
+		err := Run(c.args)
+		code := 0
+		if ee := (ExitError{}); errors.As(err, &ee) {
+			code = ee.Code
+		} else if err != nil {
+			code = -1
 		}
-		if err := s.Finish(j.ID, []string{"exited", "failed"}[i], 3, "boom", true); err != nil {
-			t.Fatal(err)
+		if code != c.code || !strings.Contains(out.String(), c.out) {
+			t.Errorf("%q: exit %d (%v), want %d; output:\n%s", c.args, code, err, c.code, out.String())
 		}
 	}
-	var buf bytes.Buffer
-	stdout = &buf
-	t.Cleanup(func() { stdout = os.Stdout })
-	if err := Run([]string{"jobs", "--owner="}); err != nil {
-		t.Fatal(err)
-	}
-	got := buf.String()
-	if strings.Count(got, "\n") != 3 || !strings.Contains(got, "exited 3") || !strings.Contains(got, "failed: boom") || !strings.Contains(got, "echo one ⏎ echo two") {
-		t.Fatalf("jobs:\n%s", got)
+	if js, _ := s.ListJobs("", true); len(js) != 2 {
+		t.Errorf("a refused run started a job: %+v", js)
 	}
 }
 
-// tool prints the MCP result: the text, the error text with exit 1, or {text, follow?} JSON for Pi.
-func TestTool(t *testing.T) {
-	t.Setenv("TAIL_MODE_HOME", t.TempDir())
-	var buf bytes.Buffer
-	stdout = &buf
-	t.Cleanup(func() { stdout = os.Stdout })
-	var ee ExitError
-	if err := Run([]string{"tool", "tail_read", `{"job":"nope"}`}); !errors.As(err, &ee) || ee.Code != 1 ||
-		!strings.HasPrefix(buf.String(), `error: no job "nope"`) || !strings.Contains(buf.String(), "\nhelp: ") {
-		t.Fatalf("%v %q", err, buf.String())
+// Pi runs `follow --deliver jsonl` and relies on the last line being the final digest.
+func TestFollowJSONLEndsFinal(t *testing.T) {
+	s := testutil.Store(t)
+	j := testutil.Job(t, s, store.Job{Status: "exited"}, "done")
+	out, err := exec.Command(os.Args[0], "follow", j.ID, "--deliver", "jsonl").Output()
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	var d struct {
+		Final    bool `json:"final"`
+		ExitCode *int `json:"exit_code"`
 	}
-	buf.Reset()
-	if err := Run([]string{"tool", "tail_jobs", "--client", "pi"}); err != nil || !strings.HasPrefix(buf.String(), `{"text":"jobs: 0 jobs for`) {
-		t.Fatalf("%v %q", err, buf.String())
+	if err != nil || json.Unmarshal([]byte(lines[len(lines)-1]), &d) != nil || !d.Final || d.ExitCode == nil || *d.ExitCode != 0 {
+		t.Fatalf("%v %+v:\n%s", err, d, out)
 	}
 }

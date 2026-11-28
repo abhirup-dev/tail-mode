@@ -37,10 +37,10 @@ tail-mode run --host vps --dir '~/app' --env PORT=8080 --login -- ./serve.sh
 ```
 
 `run` options: `--name N`, `--host H`, `--dir D`, `--env K=V` (repeatable), `--shell S`, `--login`,
-`--every 30s` / `--match RE` (start a notifier from the job's first line; deliver as `notify`, else it
-prints the Claude Code recipe), `--until RE [--timeout 30m]` (block: exit 0 match, 3 timeout, 4 job
-ended; the job keeps running), `--json`. After `--`, one argument is used verbatim as a shell command
-(`run -- 'make 2>&1 | tee build.log'`); several are shell-quoted and joined.
+`--every 30s` / `--match RE` (notify from the job's first line, as `notify_every`/`notify_match`),
+`--until RE [--timeout 30m]` (block: exit 0 match, 3 timeout, 4 job ended; the job keeps running). After
+`--`, one argument is used verbatim as a shell command (`run -- 'make 2>&1 | tee build.log'`); several
+are shell-quoted and joined.
 
 Command options (`tail_start` / `start --cmd` / `run`; cmd only):
 
@@ -75,17 +75,17 @@ Pitfalls:
 | Do | MCP / Pi tool | CLI |
 |---|---|---|
 | Run a command | `tail_start {cmd, dir, env?, shell?, login?, host?, name?, notify_every?, notify_match?}` | `tail-mode run [--name N] [--host H] [--dir D] [--env K=V]… [--shell S] [--login] [--every 30s] [--match RE] [--until RE] -- CMD…` |
-| Start | `tail_start {file\|cmd\|source+config, host?, name?, backlog?, restart?}` | `tail-mode start --file PATH [--backlog N]` / `--cmd 'CMD' [--dir D] [--env K=V]… [--shell S] [--login]` / `--source KIND --config JSON`, plus `[--host H \| --transport T --target X] [--name N] [--restart\|--no-restart]` |
+| Start | `tail_start {file\|cmd\|source+config, host?, name?, backlog?, restart?}` | `tail-mode start --file PATH [--backlog N]` / `--cmd 'CMD' [--dir D] [--env K=V]… [--shell S] [--login]` / `--source KIND --config JSON`, plus `[--host H] [--name N] [--restart\|--no-restart]` |
 | Block until ready (short waits) | `tail_wait {job, until, timeout? (50s, max 5m), after? (0)}` | `tail-mode wait <job> --until RE [--timeout 30m] [--after 0]` |
 | New lines | `tail_read {job, after: <cursor>}` | `tail-mode read <job> --after ID [--grep RE] [--tail N]` |
 | Search | `tail_search {query, job?, since: "1h"}` | `tail-mode search 'q' [--job J] [--since 1h]` |
 | SQL | `tail_sql {query}` over `jobs`, `lines(id,job,ts,text)` (one SELECT, 5 s) | `tail-mode sql 'select …'` |
 | List / stop | `tail_jobs {all?}`, `tail_stop {job, force?}` | `tail-mode jobs [--all]`, `tail-mode stop <job> [--force]` |
 
-MCP and Pi share one tool implementation, so params, results and errors are identical. Every tool takes
+MCP, Pi and the CLI share one tool implementation, so results and errors are identical. Every tool takes
 an optional `owner` (outside T3 only; `tail_sql` ignores it); the CLI takes `--owner O`
-(default `$T3CODE_THREAD_ID`) and `notify --thread ID` for humans and scripts. `tail_sql` is not
-scoped: filter with `jobs.owner` (`tail_jobs` shows yours).
+(default `$T3CODE_THREAD_ID`). `tail_sql` is not scoped: filter with `jobs.owner` (`tail_jobs` shows
+yours).
 
 - MCP results are compact [TOON](https://toonformat.dev): `key: value` lines and tables like
   `lines[3]{id,time,text}:` with one row per line, then `cursor: N` and a short `help[n]:` of next steps.
@@ -106,7 +106,7 @@ scoped: filter with `jobs.owner` (`tail_jobs` shows yours).
   dir (the shared MCP server refuses it); `~/x` is the home dir where the job runs (also over ssh).
 - `host` is an ssh host to run on; omit it for local. `dir` and `file` paths are resolved on the
   target host for host jobs (local paths for local jobs; absolute required in shared mode). Any source
-  runs over ssh. MCP tools take only `host`; the CLI also has the generic `--transport T --target X`.
+  runs over ssh.
 - Example: `tail_start {"name": "build", "host": "vps", "dir": "/srv/app", "cmd": "./build.sh",
   "env": {"MODE": "prod"}, "notify_match": "ERROR|FAIL"}`.
 - `restart` defaults to yes for files, no for commands.

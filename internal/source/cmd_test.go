@@ -11,7 +11,9 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/abhirup-dev/tail-mode/internal/testutil"
 	"github.com/abhirup-dev/tail-mode/internal/transport"
 )
 
@@ -129,7 +131,7 @@ func TestFileTildePath(t *testing.T) {
 	var c collector
 	done := make(chan error, 1)
 	go func() { done <- src.Stream(ctx, local(t), false, c.emit) }()
-	waitFor(t, func() bool { return len(c.get()) == 3 })
+	testutil.WaitFor(t, 5*time.Second, func() bool { return len(c.get()) == 3 })
 	cancel()
 	<-done
 	if got := c.get(); !reflect.DeepEqual(got, []string{"2", "3", "4"}) {
@@ -161,6 +163,11 @@ func TestLocalDefaults(t *testing.T) {
 	}
 	if _, err := LocalDefaults(Spec{Kind: "tmux"}, cwd); err == nil {
 		t.Error("unknown kind accepted")
+	}
+	for _, c := range []Spec{{Kind: "cmd", Config: json.RawMessage(`{"cmd":"x"}`)}, {Kind: "file", Config: json.RawMessage(`{"path":"a.log"}`)}} {
+		if _, err := LocalDefaults(c, ""); !errors.Is(err, ErrNeedAbsolute) { // cwd unknown (shared mode)
+			t.Errorf("%s with no cwd: %v", c.Config, err)
+		}
 	}
 }
 
@@ -246,7 +253,7 @@ func TestSSHFileTilde(t *testing.T) {
 	var c collector
 	done := make(chan error, 1)
 	go func() { done <- src.Stream(ctx, tr, false, c.emit) }()
-	waitFor(t, func() bool { return len(c.get()) == 2 })
+	testutil.WaitFor(t, 5*time.Second, func() bool { return len(c.get()) == 2 })
 	cancel()
 	<-done
 	if got := c.get(); !reflect.DeepEqual(got, []string{"one", "two"}) {
